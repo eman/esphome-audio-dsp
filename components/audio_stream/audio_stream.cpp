@@ -20,6 +20,12 @@ static const char *const TAG = "audio_stream";
 // disappears, small enough that a 24-bit conversion buffer stays modest.
 static constexpr uint32_t kChunkSamples = 2048;
 
+// How long a client may stall before it is given up on. Long enough to ride
+// out a WiFi hiccup, short enough that a laptop that has gone to sleep does
+// not hold a slot indefinitely.
+static constexpr uint32_t kStallWaitMs = 20;
+static constexpr uint8_t kMaxStalls = 250;  // 5 s
+
 struct ClientArg {
   AudioStream *stream;
   int fd;
@@ -44,6 +50,16 @@ void AudioStream::setup() {
     return;
   }
   sample_rate_ = source_->sample_rate();
+  if (want_rate_ > 0 && want_rate_ != sample_rate_) {
+    if (want_rate_ == 0 || sample_rate_ % want_rate_ != 0) {
+      ESP_LOGW(TAG, "%u Hz does not divide the source's %u Hz; streaming at full rate",
+               (unsigned) want_rate_, (unsigned) sample_rate_);
+    } else {
+      decim_ = (uint8_t) (sample_rate_ / want_rate_);
+      ESP_LOGI(TAG, "streaming at %u Hz (1/%u of the source)", (unsigned) out_rate(),
+               (unsigned) decim_);
+    }
+  }
   if (!this->start()) {
     this->mark_failed();
     return;
@@ -55,13 +71,13 @@ void AudioStream::dump_config() {
   ESP_LOGCONFIG(TAG, "Audio stream:");
   ESP_LOGCONFIG(TAG, "  http://<node>:%u/audio.wav", (unsigned) port_);
   ESP_LOGCONFIG(TAG, "  %u-bit, %u Hz, up to %u clients, %.1f s buffer", (unsigned) bits_,
-                (unsigned) sample_rate_, (unsigned) max_clients_,
-                (float) capacity_ / (float) sample_rate_);
+                (unsigned) out_rate(), (unsigned) max_clients_,
+                (float) capacity_ / (float) out_rate());
   ESP_LOGCONFIG(TAG, "  Add ?gain=<dB> to listen; leave it off to measure.");
 }
 
 bool AudioStream::start() {
-  capacity_ = (uint32_t) ((uint64_t) sample_rate_ * buffer_ms_ / 1000ULL);
+  capacity_ = (uint32_t) ((uint64_t) out_rate() * buffer_ms_ / 1000ULL);
   if (capacity_ < kChunkSamples * 2)
     capacity_ = kChunkSamples * 2;
 
@@ -87,6 +103,29 @@ bool AudioStream::start() {
 void AudioStream::push(const int32_t *samples, uint32_t n) {
   if (ring_ == nullptr)
     return;
+
+  // Decimating here rather than per client keeps one copy of the audio and
+  // means the ring covers decim_ times as much time for the same memory.
+  //
+  // The filter is a box average over decim_ samples, which is a crude
+  // anti-alias - it has nulls at multiples of the output rate but only about
+  // 13 dB of first-sidelobe rejection. That is fine for listening, which is
+  // what decimation is for, and wrong for measurement. Analysis should read
+  // the undecimated path.
+  if (decim_ > 1) {
+    for (uint32_t i = 0; i < n; i++) {
+      decim_acc_ += samples[i];
+      if (++decim_n_ < decim_)
+        continue;
+      const int32_t v = (int32_t) (decim_acc_ / decim_);
+      decim_acc_ = 0;
+      decim_n_ = 0;
+      const uint32_t off = (uint32_t) (write_pos_ % capacity_);
+      ring_[off] = v;
+      write_pos_ += 1;
+    }
+    return;
+  }
   uint32_t offset = (uint32_t) (write_pos_ % capacity_);
   uint32_t remaining = n;
   const int32_t *src = samples;
@@ -195,7 +234,7 @@ void AudioStream::client_loop(int fd) {
   }
 
   const uint8_t bytes_per_sample = bits_ / 8;
-  const uint32_t byte_rate = sample_rate_ * bytes_per_sample;
+  const uint32_t byte_rate = out_rate() * bytes_per_sample;
 
   // Streaming WAV: the RIFF and data sizes are unknowable in advance, so use
   // the usual 0xFFFFFFFF sentinel. ffmpeg, sox, VLC and Audacity all accept it.
@@ -209,7 +248,8 @@ void AudioStream::client_loop(int fd) {
   const uint16_t pcm = 1, channels = 1;
   memcpy(hdr + 20, &pcm, 2);
   memcpy(hdr + 22, &channels, 2);
-  memcpy(hdr + 24, &sample_rate_, 4);
+  const uint32_t hdr_rate = out_rate();
+  memcpy(hdr + 24, &hdr_rate, 4);
   memcpy(hdr + 28, &byte_rate, 4);
   const uint16_t block_align = bytes_per_sample;
   const uint16_t bits16 = bits_;
@@ -283,13 +323,33 @@ void AudioStream::client_loop(int fd) {
     }
 
     uint32_t sent = 0;
+    uint8_t stalls = 0;
     while (sent < written) {
       const int got = ::send(fd, out + sent, written - sent, 0);
-      if (got <= 0) {
-        ok = false;
-        break;
+      if (got > 0) {
+        sent += got;
+        stalls = 0;
+        continue;
       }
-      sent += got;
+      // A send that cannot proceed right now is not a dead client. On WiFi the
+      // window closes for a moment all the time, and SO_SNDTIMEO turns that
+      // into EAGAIN. Treating it as fatal closed the stream mid-listen - the
+      // symptom being a player reporting the stream ended, rather than a gap.
+      // Keep the ring filling and try again; the reader catches up afterwards,
+      // or falls far enough behind that the drop logic above skips it forward.
+      if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+        if (++stalls > kMaxStalls) {
+          ESP_LOGW(TAG, "client stalled for %u s; dropping it",
+                   (unsigned) (kMaxStalls * kStallWaitMs / 1000));
+          ok = false;
+          break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(kStallWaitMs));
+        continue;
+      }
+      ESP_LOGI(TAG, "client send failed: errno %d", errno);
+      ok = false;
+      break;
     }
     read_pos += n;
   }

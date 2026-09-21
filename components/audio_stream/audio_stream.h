@@ -37,6 +37,13 @@ class AudioStream : public Component {
   void set_max_clients(uint8_t n) { max_clients_ = n; }
   void set_buffer_ms(uint32_t ms) { buffer_ms_ = ms; }
   void set_sample_rate(uint32_t sr) { sample_rate_ = sr; }
+  // Decimation factor applied before the ring, so every client gets the same
+  // rate and the ring holds proportionally more time.
+  void set_decimation(uint8_t d) { decim_ = d < 1 ? 1 : d; }
+  // Requested output rate; the factor is worked out in setup(), once the
+  // source's rate is known, and refused if it does not divide exactly.
+  void set_stream_rate(uint32_t r) { want_rate_ = r; }
+  uint32_t out_rate() const { return sample_rate_ / decim_; }
 
   // Allocates the ring (PSRAM when available) and starts the accept task.
   bool start();
@@ -62,6 +69,11 @@ class AudioStream : public Component {
   uint8_t max_clients_{2};
   uint32_t buffer_ms_{1000};
   uint32_t sample_rate_{48000};
+  uint8_t decim_{1};
+  uint32_t want_rate_{0};
+  // Box-filter accumulator for decimation: sum decim_ samples, emit the mean.
+  int64_t decim_acc_{0};
+  uint8_t decim_n_{0};
 
   int32_t *ring_{nullptr};
   uint32_t capacity_{0};  // samples

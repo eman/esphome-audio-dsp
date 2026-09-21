@@ -8,7 +8,7 @@ client that cannot keep up loses audio rather than stalling the analysis.
 import esphome.codegen as cg
 from esphome.components import audio_source
 import esphome.config_validation as cv
-from esphome.const import CONF_ID, CONF_PORT
+from esphome.const import CONF_ID, CONF_PORT, CONF_SAMPLE_RATE
 
 CODEOWNERS = ["@eman"]
 ESP_PLATFORMS = ["esp32"]
@@ -32,6 +32,12 @@ CONFIG_SCHEMA = cv.Schema(
         # the signal of interest is 70 dB below full scale.
         cv.Optional(CONF_BITS_PER_SAMPLE, default=24): cv.one_of(16, 24, int=True),
         cv.Optional(CONF_MAX_CLIENTS, default=4): cv.int_range(min=1, max=8),
+        # Stream at a lower rate than the source, for listening over a link
+        # that cannot carry the full rate. Must divide the source rate exactly.
+        # The analyzer is unaffected - it reads the source directly.
+        #
+        # 48 kHz 24-bit is 1.15 Mbit/s; 16 kHz 16-bit is 0.26 Mbit/s.
+        cv.Optional(CONF_SAMPLE_RATE): cv.int_range(min=4000, max=96000),
         # Slack before a slow client starts losing audio.
         cv.Optional(CONF_BUFFER_DURATION, default="1s"): cv.All(
             cv.positive_time_period_milliseconds,
@@ -51,4 +57,6 @@ async def to_code(config):
     cg.add(var.set_port(config[CONF_PORT]))
     cg.add(var.set_bits(config[CONF_BITS_PER_SAMPLE]))
     cg.add(var.set_max_clients(config[CONF_MAX_CLIENTS]))
+    if (out_rate := config.get(CONF_SAMPLE_RATE)) is not None:
+        cg.add(var.set_stream_rate(out_rate))
     cg.add(var.set_buffer_ms(config[CONF_BUFFER_DURATION].total_milliseconds))
