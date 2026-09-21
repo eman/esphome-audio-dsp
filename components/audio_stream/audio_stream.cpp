@@ -183,7 +183,7 @@ void AudioStream::client_loop(int fd) {
 
   float gain = 1.0f;
   if (const char *q = strstr(req, "gain=")) {
-    // Clamped at 60 dB: beyond that the quantisation of a quiet signal is
+    // Clamped at 60 dB: beyond that the quantization of a quiet signal is
     // louder than anything worth hearing.
     float db = strtof(q + 5, nullptr);
     if (db < 0.0f)

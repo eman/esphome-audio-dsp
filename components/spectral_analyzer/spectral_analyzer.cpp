@@ -155,7 +155,7 @@ bool SpectrumChannel::allocate() {
 
 void SpectrumChannel::accumulate_frame() {
   const uint32_t n = fft_size;
-  // Normalisation: a full-scale sine reads -3.01 dB, the RMS convention.
+  // Normalization: a full-scale sine reads -3.01 dB, the RMS convention.
   const float norm = 2.0f / ((float) n * (float) n * window_cg * window_cg);
 
   for (uint32_t i = 0; i < n; i++) {
@@ -425,7 +425,7 @@ void SpectralAnalyzer::update() {
     if (b.prominence != nullptr) {
       // Median of the band's own bins: one narrow tone cannot move it, so the
       // peak measures itself against the noise it is sitting in. Falls back to
-      // the guarded neighbourhood when the band is too narrow to have a
+      // the guarded neighborhood when the band is too narrow to have a
       // meaningful interior median.
       const float local = (k_hi - k_lo >= 16)
                               ? median_bin_power(psd, half, bin_hz, b.f_low, b.f_high, 0.0f, 0.0f)
@@ -500,7 +500,7 @@ void SpectralAnalyzer::scan_spectrum_(const float *psd, uint32_t half, float bin
     const float floor_pw = block[n / 2];
 
     for (uint32_t k = std::max(base, k_lo + 1); k < end; k++) {
-      // A local maximum, strictly above one neighbour so a flat run of equal
+      // A local maximum, strictly above one neighbor so a flat run of equal
       // bins reports once rather than at every bin.
       if (psd[k] < psd[k - 1] || psd[k] <= psd[k + 1])
         continue;
