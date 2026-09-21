@@ -1,0 +1,146 @@
+# Everything the components do: analysis, discovery, streaming, and retuning a
+# band from Home Assistant without a reflash.
+esphome:
+  name: audio-dsp-full
+
+esp32:
+  board: esp32-p4-function-ev-board
+  framework:
+    type: esp-idf
+
+# Any network will do; this node happens to be wired.
+ethernet:
+  type: W5500
+  clk_pin: GPIO0
+  mosi_pin: GPIO1
+  miso_pin: GPIO2
+  cs_pin: GPIO3
+  interrupt_pin: GPIO4
+  reset_pin: GPIO5
+
+logger:
+api:
+  # These surface in Home Assistant as esphome.audio_dsp_full_* actions.
+  #
+  # Bands cannot be *added* at runtime - ESPHome fixes its entity list at
+  # compile time, so there would be no sensors to publish a new one on.
+  # Declare spare bands (see `spare1` below) and aim them wherever the
+  # discovery scan points. Changes are saved and survive a reboot.
+  actions:
+    - action: retune_band
+      variables:
+        band: string
+        f_low: float
+        f_high: float
+      then:
+        - spectral_analyzer.set_band:
+            band: !lambda "return band;"
+            f_low: !lambda "return f_low;"
+            f_high: !lambda "return f_high;"
+    - action: reset_band
+      variables:
+        band: string
+      then:
+        - spectral_analyzer.reset_band:
+            band: !lambda "return band;"
+    - action: reset_all_bands
+      then:
+        - spectral_analyzer.reset_all_bands:
+
+ota:
+  - platform: esphome
+psram:
+
+external_components:
+  - source: github://eman/esphome-audio-dsp
+
+audio_source:
+  id: mic
+  bclk_pin: 20
+  ws_pin: 21
+  din_pin: 22
+  sample_rate: 48000
+  # 16 x 1023 samples = 341 ms of DMA. This has to cover the longest a
+  # consumer blocks: a 32768-point FFT takes about 114 ms. Too small and audio
+  # is lost silently - see the README.
+  dma_buffers: 16
+  dma_frame_size: 1023
+
+spectral_analyzer:
+  source: mic
+  update_interval: 5s
+  # 32768 at 48 kHz gives 1.46 Hz bins, which is what resolves a drifting tone
+  # from a crystal-locked one.
+  fft_size: 32768
+  broadband_rms:
+    name: "Broadband level"
+  noise_floor:
+    name: "Noise floor"
+
+  spectrum_scan:
+    update_interval: 5min
+    top_n: 8
+    min_prominence: 6
+    persistence: 2
+    f_low: 20
+    f_high: 22000
+    peaks:
+      name: "Spectrum peaks"
+
+  bands:
+    - name: rumble
+      f_low: 20
+      f_high: 200
+      level:
+        name: "Rumble level"
+        id: rumble_level
+
+    # A band is 110 Hz wide here so the stability figure means the same thing
+    # from one band to the next: a peak needs room to wander before the band
+    # edges clip it.
+    - name: tone700
+      f_low: 645
+      f_high: 755
+      level:
+        name: "Tone 700 level"
+      peak_frequency:
+        name: "Tone 700 peak"
+      peak_prominence:
+        name: "Tone 700 prominence"
+        id: tone700_prominence
+      peak_stability:
+        name: "Tone 700 stability"
+        id: tone700_stability
+
+    # Spare, for aiming at whatever the scan finds. Retune it from Home
+    # Assistant rather than reflashing.
+    - name: spare1
+      f_low: 1000
+      f_high: 1110
+      peak_frequency:
+        name: "Spare 1 peak"
+      peak_prominence:
+        name: "Spare 1 prominence"
+      peak_stability:
+        name: "Spare 1 stability"
+
+audio_stream:
+  source: mic
+  port: 8080
+  bits_per_sample: 24
+  max_clients: 4
+  buffer_duration: 1s
+
+binary_sensor:
+  - platform: template
+    name: "Tone 700 present"
+    lambda: |-
+      const float prom = id(tone700_prominence).state;
+      const float sd = id(tone700_stability).state;
+      if (isnan(prom) || isnan(sd)) return {};
+      // Either a clearly prominent peak, or a weaker one holding its
+      // frequency. Level alone loses a source that fades.
+      return prom > 8.0f || (prom > 4.0f && sd < 4.0f);
+    filters:
+      - delayed_on: 10s
+      - delayed_off: 60s

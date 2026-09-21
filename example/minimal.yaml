@@ -1,0 +1,46 @@
+# Smallest useful configuration: broadband level and one tracked band.
+esphome:
+  name: audio-dsp-minimal
+
+esp32:
+  board: esp32-p4-function-ev-board
+  framework:
+    type: esp-idf
+
+# Any network will do; this node happens to be wired.
+ethernet:
+  type: W5500
+  clk_pin: GPIO0
+  mosi_pin: GPIO1
+  miso_pin: GPIO2
+  cs_pin: GPIO3
+  interrupt_pin: GPIO4
+  reset_pin: GPIO5
+
+logger:
+api:
+ota:
+  - platform: esphome
+
+psram:
+
+external_components:
+  - source: github://eman/esphome-audio-dsp
+    components: [audio_source, spectral_analyzer]
+
+audio_source:
+  id: mic
+  bclk_pin: 20
+  ws_pin: 21
+  din_pin: 22
+
+spectral_analyzer:
+  source: mic
+  broadband_rms:
+    name: "Broadband level"
+  bands:
+    - name: mains_hum
+      f_low: 110
+      f_high: 130
+      level:
+        name: "Hum 120 level"
