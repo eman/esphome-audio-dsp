@@ -56,8 +56,9 @@ struct SpectrumPeak {
 };
 
 // A spectrum path: buffers, a power accumulator, and the bands read off it.
-// Kept as its own type so a second microphone on the same I2S bus (the
-// bearing array in HARDWARE.md) can be added as a second channel later.
+// Kept as its own type so a second microphone can be added as a second
+// channel later - two mics a known distance apart give bearing from the
+// cross-spectrum phase.
 //
 // Sizes are 32-bit throughout: at fft_size 65536 a 16-bit loop counter in the
 // FFT would wrap to zero and never terminate.
