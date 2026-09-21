@@ -26,27 +26,6 @@ static void *big_alloc(size_t bytes) {
   return p;
 }
 
-// The FFT's working buffers, which want internal RAM rather than PSRAM.
-//
-// re[] and im[] are read and written log2(n) times per frame in a scattered
-// butterfly pattern - by far the heaviest memory traffic the node generates,
-// and concentrated into a burst every fft_size samples. With them in PSRAM
-// that burst was audible in the microphone: a hiss pulsing at exactly the FFT
-// frame rate, 41 dB above the envelope floor in the 4-12 kHz band, which
-// followed the frame rate when fft_size was halved. No samples were being
-// lost - capture ran at 99.93% of real time throughout - so this is coupling,
-// not dropout.
-//
-// Falls back to PSRAM, because a large fft_size will not fit internally and a
-// working node with a hiss beats one that will not allocate.
-static void *hot_alloc(size_t bytes) {
-  void *p = heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  if (p != nullptr)
-    return p;
-  ESP_LOGW(TAG, "%u bytes would not fit in internal RAM; using PSRAM", (unsigned) bytes);
-  return heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-}
-
 // Sub-bin peak position by parabolic fit on the log-magnitude, which is what
 // gets 700.00 Hz out of 1.46 Hz bins.
 static float interpolate_peak(const float *psd, uint32_t half, uint32_t k) {
@@ -124,8 +103,25 @@ static float median_bin_power(const float *psd, uint32_t half, float bin_hz, flo
 
 bool SpectrumChannel::allocate() {
   const uint32_t n = fft_size;
-  re = static_cast<float *>(hot_alloc(sizeof(float) * n));
-  im = static_cast<float *>(hot_alloc(sizeof(float) * n));
+  // re[] and im[] go together or not at all. The butterfly touches both
+  // equally, so splitting them keeps half the PSRAM traffic while also eating
+  // the internal RAM - the worst of both. Seen on an ESP32-S3, where re fitted
+  // and im did not.
+  const size_t buf = sizeof(float) * n;
+  re = static_cast<float *>(heap_caps_malloc(buf, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  im = re == nullptr ? nullptr
+                     : static_cast<float *>(
+                           heap_caps_malloc(buf, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  if (im == nullptr) {
+    if (re != nullptr) {
+      free(re);
+      re = nullptr;
+    }
+    ESP_LOGW(TAG, "%u bytes x2 will not fit in internal RAM; both FFT buffers go to PSRAM",
+             (unsigned) buf);
+    re = static_cast<float *>(big_alloc(buf));
+    im = static_cast<float *>(big_alloc(buf));
+  }
   window = static_cast<float *>(big_alloc(sizeof(float) * n));
   psd_accum = static_cast<float *>(big_alloc(sizeof(float) * half()));
   psd_snapshot = static_cast<float *>(big_alloc(sizeof(float) * half()));
