@@ -139,6 +139,37 @@ Leave it off for anything you intend to measure.
 The capture path never waits on a socket: samples go to a ring buffer, and a
 client that cannot keep up loses audio and logs how much.
 
+## Streaming over WiFi needs a bigger TCP window
+
+lwIP's default send buffer in ESPHome is 5744 bytes. Throughput over TCP is
+bounded by window divided by round trip time, so on a link with 37 ms RTT that
+is a hard ceiling of about 1.2 Mbit/s no matter how good the radio is - and a
+48 kHz 24-bit stream wants 1.15 Mbit/s. Measured on an ESP32-S3 over WiFi,
+raising the window took delivery from 65% of real time to 81%:
+
+```yaml
+esp32:
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_LWIP_TCP_SND_BUF_DEFAULT: "65534"
+      CONFIG_LWIP_TCP_WND_DEFAULT: "65534"
+      CONFIG_LWIP_TCP_MSS: "1440"
+```
+
+Raising the WiFi driver's own TX buffers and block-ack windows on top of that
+made no further difference on the same link, so reach for the TCP settings
+first.
+
+Two other things that cost real time on a constrained node, both measured:
+
+- **A heavy analyzer starves the stream.** With `fft_size: 32768` and the FFT
+  buffers in PSRAM, an S3 delivered 86% of real time; with the analyzer off,
+  97%. If a node's job is to stream, give it no analyzer, or a small one.
+- **Bitrate is not always the problem.** On that link, cutting 1.15 Mbit/s to
+  0.26 changed delivery from 73% to 86% - nothing like proportional, because
+  the limit was elsewhere. Measure before trading away sample rate or bits.
+
 ## `use_apll` defaults to true here
 
 ESPHome's `i2s_audio` offers the same option and defaults it to false. For
