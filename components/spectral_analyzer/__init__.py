@@ -43,6 +43,18 @@ CONF_MIN_PROMINENCE = "min_prominence"
 CONF_PERSISTENCE = "persistence"
 CONF_PEAKS = "peaks"
 CONF_BAND = "band"
+CONF_HARMONICS = "harmonics"
+CONF_TOLERANCE = "tolerance"
+CONF_ORDERS = "orders"
+CONF_ORDER = "order"
+CONF_RELATIVE_LEVEL = "relative_level"
+CONF_PROMINENCE = "prominence"
+CONF_FREQUENCY = "frequency"
+CONF_ZOOM = "zoom"
+
+# A zoom frame longer than this is a minute of source behavior averaged into
+# one number; nothing this component looks at holds still that long.
+ZOOM_MAX_FRAME_S = 60.0
 
 spectral_analyzer_ns = cg.esphome_ns.namespace("spectral_analyzer")
 SpectralAnalyzer = spectral_analyzer_ns.class_("SpectralAnalyzer", cg.PollingComponent)
@@ -95,6 +107,75 @@ SCAN_SCHEMA = cv.All(
 )
 
 
+def _hz_fine_sensor():
+    return sensor.sensor_schema(
+        unit_of_measurement=UNIT_HERTZ,
+        accuracy_decimals=3,
+        state_class=STATE_CLASS_MEASUREMENT,
+    )
+
+
+def _db_relative_sensor():
+    # Not signal_strength: a level relative to the fundamental is a ratio.
+    return sensor.sensor_schema(
+        unit_of_measurement=UNIT_DECIBEL,
+        accuracy_decimals=1,
+        state_class=STATE_CLASS_MEASUREMENT,
+    )
+
+
+def _validate_orders(orders):
+    seen = [o[CONF_ORDER] for o in orders]
+    if len(seen) != len(set(seen)):
+        raise cv.Invalid("each harmonic order may appear only once")
+    return orders
+
+
+# Harmonics of the band's peak, measured at order x f0. Tells a machine (a
+# series) from a whistle or a resonance (mostly a single line).
+HARMONICS_SCHEMA = cv.Schema(
+    {
+        # Search half-width per order: H3 is looked for within +/-3x this.
+        # Grows with order because a drifting fundamental smears its nth
+        # harmonic n times wider.
+        cv.Optional(CONF_TOLERANCE, default=2.0): cv.float_range(min=0.1, max=50.0),
+        # The fundamental must clear this prominence or nothing is measured:
+        # harmonics of a noise peak are noise.
+        cv.Optional(CONF_MIN_PROMINENCE, default=6.0): cv.float_range(min=0.0, max=60.0),
+        cv.Required(CONF_ORDERS): cv.All(
+            cv.ensure_list(
+                cv.Schema(
+                    {
+                        cv.Required(CONF_ORDER): cv.int_range(min=2, max=32),
+                        cv.Optional(CONF_RELATIVE_LEVEL): _db_relative_sensor(),
+                        cv.Optional(CONF_PROMINENCE): _db_sensor(),
+                        cv.Optional(CONF_FREQUENCY): _hz_sensor(),
+                    }
+                )
+            ),
+            cv.Length(min=1),
+            _validate_orders,
+        ),
+    }
+)
+
+# A high-resolution spectrum of this band alone; see dsp.h ZoomFFT.
+ZOOM_SCHEMA = cv.Schema(
+    {
+        cv.Optional(CONF_FFT_SIZE, default=2048): cv.one_of(
+            256, 512, 1024, 2048, 4096, 8192, 16384, int=True
+        ),
+        cv.Optional(CONF_PEAK_FREQUENCY): _hz_fine_sensor(),
+        cv.Optional(CONF_PEAK_PROMINENCE): _db_sensor(),
+    }
+)
+
+
+def zoom_decimation(sample_rate, bandwidth):
+    """Must match dsp::ZoomFFT::decimation_for."""
+    return max(1, int(sample_rate * 0.7 / max(bandwidth, 0.1)))
+
+
 def _validate_band(conf):
     if conf[CONF_F_HIGH] <= conf[CONF_F_LOW]:
         raise cv.Invalid(f"{CONF_F_HIGH} must be greater than {CONF_F_LOW}")
@@ -115,6 +196,8 @@ BAND_SCHEMA = cv.All(
             # Spread of the per-frame peak across the interval: small means a
             # tone is holding its frequency, regardless of how loud it is.
             cv.Optional(CONF_PEAK_STABILITY): _hz_sensor(),
+            cv.Optional(CONF_HARMONICS): HARMONICS_SCHEMA,
+            cv.Optional(CONF_ZOOM): ZOOM_SCHEMA,
         }
     ),
     _validate_band,
@@ -129,6 +212,17 @@ def _validate_with_rate(config, sr):
                 f"band '{band[CONF_NAME]}' f_high ({band[CONF_F_HIGH]} Hz) must be below "
                 f"the Nyquist frequency ({nyquist} Hz)"
             )
+        zoom = band.get(CONF_ZOOM)
+        if zoom is not None:
+            d = zoom_decimation(sr, band[CONF_F_HIGH] - band[CONF_F_LOW])
+            frame_s = zoom[CONF_FFT_SIZE] * d / sr
+            if frame_s > ZOOM_MAX_FRAME_S:
+                raise cv.Invalid(
+                    f"band '{band[CONF_NAME]}' zoom: {zoom[CONF_FFT_SIZE]} points over a "
+                    f"{band[CONF_F_HIGH] - band[CONF_F_LOW]:g} Hz band makes {frame_s:.0f} s "
+                    f"frames ({sr / d / zoom[CONF_FFT_SIZE]:.3f} Hz bins); use a smaller "
+                    f"{CONF_FFT_SIZE} or a wider band"
+                )
     scan = config.get(CONF_SPECTRUM_SCAN)
     if scan is not None and scan[CONF_F_HIGH] >= nyquist:
         raise cv.Invalid(
@@ -231,6 +325,35 @@ async def to_code(config):
                 stability,
             )
         )
+        if CONF_HARMONICS in band:
+            harm = band[CONF_HARMONICS]
+            cg.add(var.set_harmonic_params(harm[CONF_TOLERANCE], harm[CONF_MIN_PROMINENCE]))
+            for o in harm[CONF_ORDERS]:
+                rel = (
+                    await sensor.new_sensor(o[CONF_RELATIVE_LEVEL])
+                    if CONF_RELATIVE_LEVEL in o
+                    else cg.nullptr
+                )
+                prom = (
+                    await sensor.new_sensor(o[CONF_PROMINENCE]) if CONF_PROMINENCE in o else cg.nullptr
+                )
+                freq = (
+                    await sensor.new_sensor(o[CONF_FREQUENCY]) if CONF_FREQUENCY in o else cg.nullptr
+                )
+                cg.add(var.add_harmonic(o[CONF_ORDER], rel, prom, freq))
+        if CONF_ZOOM in band:
+            zoom = band[CONF_ZOOM]
+            zpeak = (
+                await sensor.new_sensor(zoom[CONF_PEAK_FREQUENCY])
+                if CONF_PEAK_FREQUENCY in zoom
+                else cg.nullptr
+            )
+            zprom = (
+                await sensor.new_sensor(zoom[CONF_PEAK_PROMINENCE])
+                if CONF_PEAK_PROMINENCE in zoom
+                else cg.nullptr
+            )
+            cg.add(var.set_zoom(zoom[CONF_FFT_SIZE], zpeak, zprom))
 
 
 # ------------------------------------------------------------ actions

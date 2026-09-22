@@ -15,7 +15,10 @@ namespace spectral_analyzer {
 
 static const char *const TAG = "spectral_analyzer";
 
-static constexpr float kTiny = 1e-20f;
+using dsp::fft;
+using dsp::interpolate_peak;
+using dsp::kTiny;
+using dsp::median_bin_power;
 
 // Large buffers go to PSRAM when present (the ESP32-P4 board has 32 MB), and
 // fall back to internal RAM so smaller FFT sizes still work without it.
@@ -24,79 +27,6 @@ static void *big_alloc(size_t bytes) {
   if (p == nullptr)
     p = heap_caps_malloc(bytes, MALLOC_CAP_8BIT);
   return p;
-}
-
-// Sub-bin peak position by parabolic fit on the log-magnitude, which is what
-// gets 700.00 Hz out of 1.46 Hz bins.
-static float interpolate_peak(const float *psd, uint32_t half, uint32_t k) {
-  float k_interp = (float) k;
-  if (k > 0 && k + 1 < half) {
-    const float y1 = 10.0f * log10f(psd[k - 1] + kTiny);
-    const float y2 = 10.0f * log10f(psd[k] + kTiny);
-    const float y3 = 10.0f * log10f(psd[k + 1] + kTiny);
-    const float denom = y1 - 2.0f * y2 + y3;
-    if (fabsf(denom) > 1e-6f) {
-      const float d = 0.5f * (y1 - y3) / denom;
-      if (d > -1.0f && d < 1.0f)
-        k_interp += d;
-    }
-  }
-  return k_interp;
-}
-
-// ---------------------------------------------------------------- FFT ----
-
-// In-place iterative radix-2 FFT. Deliberately dependency-free; esp-dsp could
-// replace it, but at these frame rates the P4 has ample headroom.
-static void fft(float *re, float *im, uint32_t n) {
-  for (uint32_t i = 1, j = 0; i < n; i++) {
-    uint32_t bit = n >> 1;
-    for (; j & bit; bit >>= 1)
-      j ^= bit;
-    j ^= bit;
-    if (i < j) {
-      std::swap(re[i], re[j]);
-      std::swap(im[i], im[j]);
-    }
-  }
-  for (uint32_t len = 2; len <= n; len <<= 1) {
-    const float ang = -2.0f * (float) M_PI / (float) len;
-    const float wr = cosf(ang), wi = sinf(ang);
-    const uint32_t h = len / 2;
-    for (uint32_t i = 0; i < n; i += len) {
-      float cr = 1.0f, ci = 0.0f;
-      for (uint32_t k = 0; k < h; k++) {
-        const float ur = re[i + k], ui = im[i + k];
-        const float vr = re[i + k + h] * cr - im[i + k + h] * ci;
-        const float vi = re[i + k + h] * ci + im[i + k + h] * cr;
-        re[i + k] = ur + vr;
-        im[i + k] = ui + vi;
-        re[i + k + h] = ur - vr;
-        im[i + k + h] = ui - vi;
-        const float nr = cr * wr - ci * wi;
-        ci = cr * wi + ci * wr;
-        cr = nr;
-      }
-    }
-  }
-}
-
-// Median of one-sided bin powers over [lo,hi] Hz, excluding [ex_lo,ex_hi].
-static float median_bin_power(const float *psd, uint32_t half, float bin_hz, float lo, float hi,
-                              float ex_lo, float ex_hi) {
-  std::vector<float> v;
-  for (uint32_t k = 1; k < half; k++) {
-    const float f = k * bin_hz;
-    if (f < lo || f > hi)
-      continue;
-    if (f >= ex_lo && f <= ex_hi)
-      continue;
-    v.push_back(psd[k]);
-  }
-  if (v.empty())
-    return kTiny;
-  std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
-  return v[v.size() / 2];
 }
 
 // ---------------------------------------------------- SpectrumChannel ----
@@ -254,6 +184,24 @@ void SpectralAnalyzer::setup() {
     this->band_defaults_.push_back({b.f_low, b.f_high});
   this->restore_bands_();
 
+  // After restore_bands_(), so a zoom starts on the range the band will
+  // actually use rather than being rebuilt a moment later.
+  for (auto &b : this->air_.bands) {
+    if (b.zoom_fft_size == 0)
+      continue;
+    b.zoom = new dsp::ZoomFFT();  // NOLINT - lives as long as the component
+    this->configure_zoom_(b);
+    this->has_zoom_ = true;
+  }
+  if (this->has_zoom_) {
+    this->zoom_lock_ = xSemaphoreCreateMutex();
+    if (this->zoom_lock_ == nullptr) {
+      ESP_LOGE(TAG, "no memory for the zoom lock");
+      this->mark_failed();
+      return;
+    }
+  }
+
   this->source_->add_consumer([this](const int32_t *s, uint32_t n) { this->on_audio(s, n); });
 }
 
@@ -261,6 +209,32 @@ void SpectralAnalyzer::setup() {
 // processes a frame whenever it fills.
 void SpectralAnalyzer::on_audio(const int32_t *samples, uint32_t count) {
   SpectrumChannel &ch = this->air_;
+  if (this->has_zoom_) {
+    // Never wait: this is the capture task. Only a retune holds this lock, and
+    // then the block is lost to the zooms, which restart at the next one
+    // rather than splicing two moments into one frame.
+    if (xSemaphoreTake(this->zoom_lock_, 0) == pdTRUE) {
+      for (auto &b : ch.bands) {
+        if (b.zoom == nullptr)
+          continue;
+        if (this->zoom_gap_)
+          b.zoom->reset();
+        for (uint32_t i = 0; i < count; i++) {
+          if (b.zoom->push((float) samples[i] / 8388608.0f)) {
+            // Handed over by copy under a spinlock, so update() reading it
+            // never makes this task drop audio.
+            portENTER_CRITICAL(&this->zoom_mux_);
+            b.zoom_latest = b.zoom->result();
+            portEXIT_CRITICAL(&this->zoom_mux_);
+          }
+        }
+      }
+      this->zoom_gap_ = false;
+      xSemaphoreGive(this->zoom_lock_);
+    } else {
+      this->zoom_gap_ = true;
+    }
+  }
   for (uint32_t i = 0; i < count; i++) {
     ch.re[this->fill_] = (float) samples[i] / 8388608.0f;  // 2^23
     if (++this->fill_ >= ch.fft_size) {
@@ -286,13 +260,7 @@ bool SpectralAnalyzer::set_band_range(const std::string &name, float f_low, floa
   for (auto &b : this->air_.bands) {
     if (b.name != name)
       continue;
-    b.f_low = f_low;
-    b.f_high = f_high;
-    // The peak statistics describe the old range; keeping them would blend two
-    // different bands into one stability figure.
-    b.peak_sum = b.peak_sq = 0.0;
-    b.peak_n = 0;
-    b.stability_hz = NAN;
+    this->apply_range_(b, f_low, f_high);
     ESP_LOGI(TAG, "band '%s' retuned to %.1f-%.1f Hz", name.c_str(), f_low, f_high);
     this->save_bands_();
     return true;
@@ -311,12 +279,46 @@ bool SpectralAnalyzer::reset_band(const std::string &name) {
 }
 
 void SpectralAnalyzer::reset_all_bands() {
-  for (size_t i = 0; i < this->air_.bands.size(); i++) {
-    this->air_.bands[i].f_low = this->band_defaults_[i].f_low;
-    this->air_.bands[i].f_high = this->band_defaults_[i].f_high;
-  }
+  for (size_t i = 0; i < this->air_.bands.size(); i++)
+    this->apply_range_(this->air_.bands[i], this->band_defaults_[i].f_low,
+                       this->band_defaults_[i].f_high);
   ESP_LOGI(TAG, "all bands back to their configured ranges");
   this->save_bands_();
+}
+
+// Move a band, and drop everything measured on its old range.
+void SpectralAnalyzer::apply_range_(Band &b, float f_low, float f_high) {
+  // The capture task reads the range and adds to the peak sums per frame.
+  if (xSemaphoreTake(this->air_.lock, pdMS_TO_TICKS(200)) == pdTRUE) {
+    b.f_low = f_low;
+    b.f_high = f_high;
+    // The peak statistics describe the old range; keeping them would blend two
+    // different bands into one stability figure.
+    b.peak_sum = b.peak_sq = 0.0;
+    b.peak_n = 0;
+    b.stability_hz = NAN;
+    xSemaphoreGive(this->air_.lock);
+  }
+  if (b.zoom == nullptr)
+    return;
+  if (xSemaphoreTake(this->zoom_lock_, pdMS_TO_TICKS(200)) != pdTRUE) {
+    ESP_LOGW(TAG, "band '%s': zoom busy, still on the old range", b.name.c_str());
+    return;
+  }
+  this->configure_zoom_(b);
+  xSemaphoreGive(this->zoom_lock_);
+  // A frame from the old range may be waiting; do not publish it as the new.
+  portENTER_CRITICAL(&this->zoom_mux_);
+  b.zoom_published = b.zoom_latest.seq;
+  portEXIT_CRITICAL(&this->zoom_mux_);
+}
+
+void SpectralAnalyzer::configure_zoom_(Band &b) {
+  b.zoom->configure((float) this->air_.sample_rate, b.f_low, b.f_high, b.zoom_fft_size);
+  ESP_LOGI(TAG, "band '%s' zoom: %u points, %.3f Hz bins, %.1f s frames (D=%u, %u taps, %u kB)",
+           b.name.c_str(), (unsigned) b.zoom_fft_size, b.zoom->bin_hz(), b.zoom->frame_s(),
+           (unsigned) b.zoom->decimation(), (unsigned) b.zoom->taps(),
+           (unsigned) (b.zoom->bytes() / 1024));
 }
 
 void SpectralAnalyzer::save_bands_() {
@@ -418,7 +420,9 @@ void SpectralAnalyzer::update() {
     if (b.stability != nullptr && !std::isnan(b.stability_hz))
       b.stability->publish_state(b.stability_hz);
 
-    if (b.prominence != nullptr) {
+    const bool need_prom = b.prominence != nullptr || !b.harmonics.empty();
+    float prom_db = NAN;
+    if (need_prom) {
       // Median of the band's own bins: one narrow tone cannot move it, so the
       // peak measures itself against the noise it is sitting in. Falls back to
       // the guarded neighborhood when the band is too narrow to have a
@@ -429,7 +433,28 @@ void SpectralAnalyzer::update() {
                                                  std::max(20.0f, b.f_low - 3.0f * (b.f_high - b.f_low)),
                                                  b.f_high + 3.0f * (b.f_high - b.f_low), b.f_low,
                                                  b.f_high);
-      b.prominence->publish_state(10.0f * log10f((psd[k_peak] + kTiny) / (local + kTiny)));
+      prom_db = 10.0f * log10f((psd[k_peak] + kTiny) / (local + kTiny));
+    }
+    if (b.prominence != nullptr)
+      b.prominence->publish_state(prom_db);
+
+    if (!b.harmonics.empty())
+      this->publish_harmonics_(b, psd, half, bin_hz, interpolate_peak(psd, half, k_peak) * bin_hz,
+                               prom_db);
+
+    if (b.zoom != nullptr) {
+      portENTER_CRITICAL(&this->zoom_mux_);
+      const dsp::ZoomFFT::Result z = b.zoom_latest;
+      portEXIT_CRITICAL(&this->zoom_mux_);
+      // A zoom frame is longer than an update interval, so most intervals
+      // have nothing new; publish each frame once, when it lands.
+      if (z.seq != b.zoom_published) {
+        b.zoom_published = z.seq;
+        if (b.zoom_peak != nullptr)
+          b.zoom_peak->publish_state(z.peak_hz);
+        if (b.zoom_prominence != nullptr)
+          b.zoom_prominence->publish_state(z.prominence_db);
+      }
     }
   }
   ESP_LOGD(TAG, "published from %u frames", (unsigned) frames);
@@ -463,6 +488,38 @@ void SpectralAnalyzer::update() {
         this->scan_text_->publish_state(summary);
 #endif
     }
+  }
+}
+
+// Each harmonic is looked for at order x the fundamental's peak, within a
+// window that widens with order: a fundamental wandering 1 Hz across the
+// interval smears its 4th harmonic across 4.
+//
+// Nothing is measured unless the fundamental itself is a tone. Harmonics of a
+// noise peak are noise, and publishing them would give a graph that looks
+// like a harmonic series whenever the band is empty.
+void SpectralAnalyzer::publish_harmonics_(const Band &b, const float *psd, uint32_t half,
+                                          float bin_hz, float f0, float prominence_db) {
+  const bool tonal = !std::isnan(prominence_db) && prominence_db >= b.harmonic_min_prom;
+  const dsp::TonalMeasure fund =
+      tonal ? dsp::measure_tone(psd, half, bin_hz, f0, b.harmonic_tol_hz) : dsp::TonalMeasure{};
+  const bool usable = fund.valid && fund.excess_power > 0.0f;
+  for (const auto &h : b.harmonics) {
+    dsp::TonalMeasure m;
+    if (usable)
+      m = dsp::measure_tone(psd, half, bin_hz, h.order * f0, h.order * b.harmonic_tol_hz);
+    // Unknown, not a number, when there is nothing to measure: absent is a
+    // finding, "no fundamental" is not.
+    float rel = NAN;
+    if (m.valid)
+      rel = m.excess_power > 0.0f ? dsp::to_db(m.excess_power) - dsp::to_db(fund.excess_power)
+                                  : -99.0f;
+    if (h.relative != nullptr)
+      h.relative->publish_state(rel);
+    if (h.prominence != nullptr)
+      h.prominence->publish_state(m.valid ? m.prominence_db : NAN);
+    if (h.frequency != nullptr)
+      h.frequency->publish_state(m.valid ? m.freq_hz : NAN);
   }
 }
 
@@ -578,6 +635,17 @@ void SpectralAnalyzer::dump_config() {
                         b.f_high != this->band_defaults_[i].f_high);
     ESP_LOGCONFIG(TAG, "    Band '%s': %.0f-%.0f Hz%s", b.name.c_str(), b.f_low, b.f_high,
                   moved ? "  (retuned at runtime)" : "");
+    if (!b.harmonics.empty()) {
+      std::string orders;
+      for (const auto &h : b.harmonics)
+        orders += (orders.empty() ? "" : ",") + std::to_string(h.order);
+      ESP_LOGCONFIG(TAG, "      Harmonics %s, +/-%.1f Hz per order, when prominence >= %.0f dB",
+                    orders.c_str(), b.harmonic_tol_hz, b.harmonic_min_prom);
+    }
+    if (b.zoom != nullptr)
+      ESP_LOGCONFIG(TAG, "      Zoom %u points: %.3f Hz bins, %.1f s frames, a result every %.1f s",
+                    (unsigned) b.zoom_fft_size, b.zoom->bin_hz(), b.zoom->frame_s(),
+                    0.5f * b.zoom->frame_s());
   }
   if (this->scan_interval_s_ > 0)
     ESP_LOGCONFIG(TAG,

@@ -5,6 +5,7 @@
 #include "esphome/core/preferences.h"
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/components/audio_source/audio_source.h"
+#include "dsp.h"
 #ifdef USE_TEXT_SENSOR
 #include "esphome/components/text_sensor/text_sensor.h"
 #endif
@@ -19,6 +20,14 @@
 
 namespace esphome {
 namespace spectral_analyzer {
+
+// One harmonic of a band's tone, measured at order x the band's peak.
+struct Harmonic {
+  uint8_t order;
+  sensor::Sensor *relative{nullptr};    // dB, power relative to the fundamental
+  sensor::Sensor *prominence{nullptr};  // dB over the local floor at n x f0
+  sensor::Sensor *frequency{nullptr};   // Hz, where it actually is
+};
 
 // One configurable frequency band.
 struct Band {
@@ -45,6 +54,21 @@ struct Band {
   // Drained result, computed under the lock so update() never reads the sums
   // while the capture task is adding to them. NaN until enough frames.
   float stability_hz{NAN};
+
+  // Harmonics of the band's peak. A motor, transformer or pump has a series;
+  // a whistle or an acoustic resonance mostly does not.
+  std::vector<Harmonic> harmonics;
+  float harmonic_tol_hz{2.0f};   // search half-width per order: +/- n x this
+  float harmonic_min_prom{6.0f}; // fundamental must clear this to be measured
+
+  // Zoom FFT over this band's range, for resolution the main FFT cannot
+  // afford. Fed by the capture task under zoom_lock; see dsp::ZoomFFT.
+  dsp::ZoomFFT *zoom{nullptr};
+  uint32_t zoom_fft_size{0};
+  sensor::Sensor *zoom_peak{nullptr};
+  sensor::Sensor *zoom_prominence{nullptr};
+  dsp::ZoomFFT::Result zoom_latest;  // copied out under zoom_mux_
+  uint32_t zoom_published{0};  // last Result::seq sent, so a frame publishes once
 };
 
 // One peak found by a full-spectrum scan.
@@ -115,6 +139,22 @@ class SpectralAnalyzer : public PollingComponent {
     b.stability = stability;
     air_.bands.push_back(b);
   }
+  // These act on the band added last, so codegen calls them straight after
+  // add_band().
+  void set_harmonic_params(float tol_hz, float min_prom) {
+    air_.bands.back().harmonic_tol_hz = tol_hz;
+    air_.bands.back().harmonic_min_prom = min_prom;
+  }
+  void add_harmonic(uint8_t order, sensor::Sensor *relative, sensor::Sensor *prominence,
+                    sensor::Sensor *frequency) {
+    air_.bands.back().harmonics.push_back({order, relative, prominence, frequency});
+  }
+  void set_zoom(uint32_t fft_size, sensor::Sensor *peak, sensor::Sensor *prominence) {
+    Band &b = air_.bands.back();
+    b.zoom_fft_size = fft_size;
+    b.zoom_peak = peak;
+    b.zoom_prominence = prominence;
+  }
 
   // ----------------------------------------------------- spectrum scan
   // Periodic sweep of the whole spectrum, reporting the strongest tonal
@@ -176,6 +216,20 @@ class SpectralAnalyzer : public PollingComponent {
 
   audio_source::AudioSource *source_{nullptr};
   uint32_t fill_{0};  // samples accumulated into re[] so far
+
+  // Zoom FFTs are fed per sample by the capture task and reconfigured by the
+  // main loop when a band is retuned; this keeps the two apart. The capture
+  // task never waits on it: if it is held, that block is dropped and the zoom
+  // restarts rather than splicing across the gap. Results come out separately,
+  // through zoom_mux_, so reading them never costs audio.
+  SemaphoreHandle_t zoom_lock_{nullptr};
+  portMUX_TYPE zoom_mux_ = portMUX_INITIALIZER_UNLOCKED;
+  bool has_zoom_{false};
+  bool zoom_gap_{false};  // capture task only
+  void configure_zoom_(Band &b);
+  void apply_range_(Band &b, float f_low, float f_high);
+  void publish_harmonics_(const Band &b, const float *psd, uint32_t half, float bin_hz,
+                          float f0, float prominence_db);
 
   // Fills peaks_ from the drained spectrum; returns how many it found.
   void scan_spectrum_(const float *psd, uint32_t half, float bin_hz);

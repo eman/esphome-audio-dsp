@@ -95,6 +95,104 @@ Prominence is measured against a *local* median computed in ~150 Hz blocks, so
 a faint whine in a quiet region outranks loud broadband hiss. This is how you
 find what to point a band at.
 
+## Harmonics
+
+A machine rarely makes one line. A motor, transformer, pump or fan has a
+series at 2x, 3x, 4x its fundamental; a whistle, a resonance or a tuned
+alarm mostly does not. `harmonics` measures that series at order x the band's
+own peak:
+
+```yaml
+    - name: tone700
+      f_low: 645
+      f_high: 755
+      harmonics:
+        tolerance: 2.0        # search +/- order x 2 Hz around order x f0
+        min_prominence: 6     # fundamental must be a tone first
+        orders:
+          - order: 2
+            relative_level:
+              name: "Tone 700 H2 relative"   # dB, H2 power over H1's
+            prominence:
+              name: "Tone 700 H2 prominence" # dB over the floor at 2 x f0
+            frequency:
+              name: "Tone 700 H2 frequency"
+```
+
+Two details carry the measurement:
+
+- **Power is summed across the window, above the local floor**, rather than
+  read off the peak bin. A fundamental wandering 1 Hz inside an interval
+  smears its 4th harmonic across 4 Hz; the peak bin would read that as the
+  harmonic being weaker, which is a fact about the drift, not the source.
+- **Nothing is published unless the fundamental clears `min_prominence`**:
+  the sensors go unknown instead. Harmonics of a noise peak are noise, and a
+  graph of them would look like a harmonic series whenever the band is empty.
+  A relative level of -99 dB means the fundamental was there and that
+  harmonic was not.
+
+## Zoom FFT
+
+Frequency resolution is 1 / frame length, whatever the method. The main FFT
+pays for it in memory: 0.077 Hz bins across the whole spectrum would need
+2^20 points and 12 MB. A `zoom` pays for one band only: mix the band down to
+0 Hz, low-pass and decimate, then run a small complex FFT on the slow signal.
+
+```yaml
+    - name: tone1200
+      f_low: 1145
+      f_high: 1255
+      zoom:
+        fft_size: 2048         # 0.077 Hz bins over this 110 Hz band
+        peak_frequency:
+          name: "Tone 1200 zoom peak"
+        peak_prominence:
+          name: "Tone 1200 zoom prominence"
+```
+
+| `fft_size` over a 110 Hz band at 48 kHz | bins | frame | result every | memory |
+|---|---|---|---|---|
+| 1024 | 0.154 Hz | 6.5 s | 3.3 s | ~62 kB |
+| 2048 | 0.077 Hz | 13.0 s | 6.5 s | ~70 kB |
+| 4096 | 0.038 Hz | 26.0 s | 13.0 s | ~86 kB |
+
+The band sits in the middle 70% of the decimated rate; the rest is the
+anti-alias filter's transition, a Blackman windowed sinc of ~18 x the
+decimation. Tested on a tone 50 dB louder than the band's signal, placed
+exactly where the decimator folds onto it: it did not come through.
+Frequency error on a steady synthetic tone is about 0.001 Hz.
+
+What it costs is time, and that is the thing to decide on:
+
+- **A tone that moves more than a bin inside one frame smears.** The source
+  this was written for drifts about 0.2 Hz/s, so 0.15 Hz bins are already as
+  fine as it supports. A steady source (another one in the same capture held
+  1176.93 Hz to +/-0.01 Hz) can use far more.
+- **Single-frame prominence has a high noise baseline.** It is one frame, not
+  an average, over hundreds of bins, so the largest noise bin alone reads
+  roughly 10-13 dB above the median. Judge a tone by a peak that repeats from
+  frame to frame, not by one frame's prominence.
+- **Frames are longer than `update_interval`**, so a zoom publishes once per
+  frame, when it lands, and most intervals publish nothing. Frames overlap by
+  half. The config validator refuses a frame over 60 s.
+
+Zooms follow their band when it is retuned at runtime. The filter runs in the
+capture task at about 19 multiply-adds per input sample for a 110 Hz band,
+and needs no input history: each sample is added into the few outputs whose
+windows it falls in.
+
+## Testing on a host
+
+`components/spectral_analyzer/dsp.h` holds the signal processing with no
+ESPHome in it. `tests/test_dsp.cpp` checks it against synthetic signals with
+known answers, and optionally a real capture:
+
+```sh
+c++ -std=c++17 -O2 -I components tests/test_dsp.cpp -o /tmp/test_dsp
+/tmp/test_dsp                 # synthetic
+/tmp/test_dsp clip.wav        # plus a 24-bit capture from audio_stream
+```
+
 ## Retuning bands at runtime
 
 ESPHome fixes its entity list at compile time, so a band cannot be **added**

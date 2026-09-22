@@ -111,6 +111,22 @@ spectral_analyzer:
       peak_stability:
         name: "Tone 700 stability"
         id: tone700_stability
+      # A machine has a harmonic series; a whistle mostly does not.
+      harmonics:
+        orders:
+          - order: 2
+            relative_level:
+              name: "Tone 700 H2 relative"
+          - order: 3
+            relative_level:
+              name: "Tone 700 H3 relative"
+      # 0.15 Hz bins over this band alone, a result every 3.3 s.
+      zoom:
+        fft_size: 1024
+        peak_frequency:
+          name: "Tone 700 zoom peak"
+        peak_prominence:
+          name: "Tone 700 zoom prominence"
 
     # Spare, for aiming at whatever the scan finds. Retune it from Home
     # Assistant rather than reflashing.
