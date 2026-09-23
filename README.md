@@ -303,6 +303,13 @@ Leave it off for anything you intend to measure.
 The capture path never waits on a socket: samples go to a ring buffer, and a
 client that cannot keep up loses audio and logs how much.
 
+The ring holds the WAV payload itself, 24-bit little-endian, packed once per
+block in the capture task. A client that takes the stream as-is (no `?gain=`,
+24-bit) sends straight out of the ring, at most two `send()` calls per chunk
+and no conversion; only a client that asks for gain or a 16-bit stream walks
+the samples, into a buffer in internal RAM. Clients sleep on a task
+notification that each block gives, so nothing polls.
+
 ## Streaming over WiFi needs a bigger TCP window
 
 lwIP's default send buffer in ESPHome is 5744 bytes. Throughput over TCP is

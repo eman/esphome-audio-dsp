@@ -24,6 +24,12 @@ namespace audio_stream {
 // socket. If a client cannot keep up it loses audio, which is the right trade:
 // the FFT analysis must not stutter because someone opened a stream on a slow
 // link.
+//
+// The ring holds the samples already packed as 24-bit little-endian bytes,
+// which is the WAV payload. Packing happens once, in the capture task, and a
+// client that wants the stream as-is (no gain, 24-bit) sends straight out of
+// the ring with no conversion and no buffer of its own. Only a client that
+// asks for gain, or a 16-bit stream, walks the samples.
 class AudioStream : public Component {
  public:
   void setup() override;
@@ -63,6 +69,19 @@ class AudioStream : public Component {
   void client_loop(int fd);
 
  protected:
+  // Clients sleep on a task notification that push() gives after every
+  // block, rather than polling. Slots are claimed and released by the client
+  // tasks under wake_mux_; push() copies the handles out under it and
+  // notifies outside it.
+  static constexpr uint8_t kMaxClientSlots = 8;
+  int claim_wake_slot_();
+  void release_wake_slot_(int slot);
+  void wake_clients_();
+  TaskHandle_t wake_[kMaxClientSlots] = {};
+  portMUX_TYPE wake_mux_ = portMUX_INITIALIZER_UNLOCKED;
+  // Rate limit for the fell-behind warning; per client, in client_loop().
+  static constexpr uint32_t kBehindLogMs = 10000;
+
   audio_source::AudioSource *source_{nullptr};
 
   uint16_t port_{8080};
@@ -76,8 +95,13 @@ class AudioStream : public Component {
   int64_t decim_acc_{0};
   uint8_t decim_n_{0};
 
-  int32_t *ring_{nullptr};
-  uint32_t capacity_{0};  // samples
+  uint8_t *ring_{nullptr};  // capacity_ samples x 3 bytes, packed 24-bit LE
+  uint32_t capacity_{0};    // samples
+  // Where push() packs a block before it goes into the ring: internal RAM,
+  // sized for one source block, so the capture task does one or two memcpys
+  // into PSRAM instead of three byte stores per sample.
+  uint8_t *stage_{nullptr};
+  uint32_t stage_samples_{0};
   // Count of samples ever written, modulo 2^32. It wraps after about a day
   // at 48 kHz and that is fine: readers only ever compute (write - read) in
   // unsigned arithmetic, which is exact across the wrap. A 64-bit counter was

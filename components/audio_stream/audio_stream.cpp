@@ -5,6 +5,8 @@
 #include "esphome/core/log.h"
 #include "esphome/components/network/util.h"
 
+#include "esphome/core/hal.h"
+
 #include <esp_heap_caps.h>
 #include <lwip/sockets.h>
 #include <algorithm>
@@ -34,6 +36,47 @@ struct ClientArg {
 static void accept_trampoline(void *arg) {
   static_cast<AudioStream *>(arg)->accept_loop();
   vTaskDelete(nullptr);
+}
+
+// 24-bit little-endian, the WAV payload, three bytes per sample.
+static inline void pack24(uint8_t *dst, int32_t s) {
+  dst[0] = (uint8_t) (s & 0xFF);
+  dst[1] = (uint8_t) ((s >> 8) & 0xFF);
+  dst[2] = (uint8_t) ((s >> 16) & 0xFF);
+}
+static inline int32_t unpack24(const uint8_t *src) {
+  int32_t v = (int32_t) src[0] | ((int32_t) src[1] << 8) | ((int32_t) src[2] << 16);
+  return (v & 0x800000) ? v - 0x1000000 : v;
+}
+
+// The per-sample work for a client that cannot send the ring as-is. The two
+// choices are template parameters so the loop carries no branches: a stream
+// is 16 or 24 bits for its whole life, and its gain is fixed at the request.
+template<bool GAIN, bool BITS16>
+static uint32_t convert(const uint8_t *ring, uint32_t capacity, uint32_t offset, uint32_t n,
+                        float gain, uint8_t *out) {
+  uint32_t written = 0;
+  for (uint32_t i = 0; i < n; i++) {
+    int32_t s = unpack24(ring + 3 * offset);
+    if (GAIN) {
+      // Saturate rather than wrap: a wrapped sample is a full-scale click,
+      // which is both unpleasant and looks like an event to a detector.
+      const float amplified = (float) s * gain;
+      s = amplified > 8388607.0f    ? 8388607
+          : amplified < -8388608.0f ? -8388608
+                                    : (int32_t) amplified;
+    }
+    if (BITS16) {
+      const int16_t v = (int16_t) (s >> 8);  // 24-bit payload down to 16
+      out[written++] = (uint8_t) (v & 0xFF);
+      out[written++] = (uint8_t) ((v >> 8) & 0xFF);
+    } else {
+      pack24(out + written, s);
+      written += 3;
+    }
+    offset = offset + 1 == capacity ? 0 : offset + 1;
+  }
+  return written;
 }
 
 static void client_trampoline(void *arg) {
@@ -81,15 +124,27 @@ bool AudioStream::start() {
   if (capacity_ < kChunkSamples * 2)
     capacity_ = kChunkSamples * 2;
 
-  const size_t bytes = sizeof(int32_t) * capacity_;
-  ring_ = static_cast<int32_t *>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  const size_t bytes = 3u * capacity_;
+  ring_ = static_cast<uint8_t *>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   if (ring_ == nullptr)
-    ring_ = static_cast<int32_t *>(heap_caps_malloc(bytes, MALLOC_CAP_8BIT));
+    ring_ = static_cast<uint8_t *>(heap_caps_malloc(bytes, MALLOC_CAP_8BIT));
   if (ring_ == nullptr) {
     ESP_LOGE(TAG, "ring buffer allocation failed (%u bytes)", (unsigned) bytes);
     return false;
   }
   memset(ring_, 0, bytes);
+
+  // One source block, packed. Decimation only ever produces fewer samples
+  // than it is given, so the same staging area covers both paths.
+  stage_samples_ = source_->block_size();
+  stage_ = static_cast<uint8_t *>(
+      heap_caps_malloc(3u * stage_samples_, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  if (stage_ == nullptr)
+    stage_ = static_cast<uint8_t *>(heap_caps_malloc(3u * stage_samples_, MALLOC_CAP_8BIT));
+  if (stage_ == nullptr) {
+    ESP_LOGE(TAG, "staging buffer allocation failed (%u bytes)", (unsigned) (3u * stage_samples_));
+    return false;
+  }
 
   // Core 0: the I2S capture and FFT task owns core 1.
   if (xTaskCreatePinnedToCore(accept_trampoline, "audio_accept", 6144, this, 3, nullptr, 0) !=
@@ -104,42 +159,89 @@ void AudioStream::push(const int32_t *samples, uint32_t n) {
   if (ring_ == nullptr)
     return;
 
-  // Decimating here rather than per client keeps one copy of the audio and
-  // means the ring covers decim_ times as much time for the same memory.
-  //
-  // The filter is a box average over decim_ samples, which is a crude
-  // anti-alias - it has nulls at multiples of the output rate but only about
-  // 13 dB of first-sidelobe rejection. That is fine for listening, which is
-  // what decimation is for, and wrong for measurement. Analysis should read
-  // the undecimated path.
+  // Pack the block in internal RAM first. Everything below is one block's
+  // worth per call, and the ring is in PSRAM where a byte store at a time
+  // would be the expensive way to fill it.
+  uint32_t packed = 0;
   if (decim_ > 1) {
+    // Decimating here rather than per client keeps one copy of the audio and
+    // means the ring covers decim_ times as much time for the same memory.
+    //
+    // The filter is a box average over decim_ samples, which is a crude
+    // anti-alias - it has nulls at multiples of the output rate but only
+    // about 13 dB of first-sidelobe rejection. That is fine for listening,
+    // which is what decimation is for, and wrong for measurement. Analysis
+    // should read the undecimated path.
     for (uint32_t i = 0; i < n; i++) {
       decim_acc_ += samples[i];
       if (++decim_n_ < decim_)
         continue;
-      const int32_t v = (int32_t) (decim_acc_ / decim_);
-      decim_acc_ = 0;
       decim_n_ = 0;
-      const uint32_t pos = write_pos_.load(std::memory_order_relaxed);
-      ring_[pos % capacity_] = v;
-      write_pos_.store(pos + 1, std::memory_order_release);
+      if (packed < stage_samples_)
+        pack24(stage_ + 3 * packed++, (int32_t) (decim_acc_ / decim_));
+      decim_acc_ = 0;
     }
-    return;
+  } else {
+    const uint32_t m = std::min(n, stage_samples_);
+    for (uint32_t i = 0; i < m; i++)
+      pack24(stage_ + 3 * i, samples[i]);
+    packed = m;
   }
+  if (packed == 0)
+    return;
+
   const uint32_t start = write_pos_.load(std::memory_order_relaxed);
   uint32_t offset = start % capacity_;
-  uint32_t remaining = n;
-  const int32_t *src = samples;
+  uint32_t remaining = packed;
+  const uint8_t *src = stage_;
   while (remaining > 0) {
     const uint32_t run = std::min(remaining, capacity_ - offset);
-    memcpy(ring_ + offset, src, sizeof(int32_t) * run);
-    src += run;
+    memcpy(ring_ + 3u * offset, src, 3u * run);
+    src += 3u * run;
     remaining -= run;
     offset = (offset + run) % capacity_;
   }
-  // Published last, with release ordering: a reader that sees the new count
-  // is guaranteed the samples behind it are already in the ring.
-  write_pos_.store(start + n, std::memory_order_release);
+  // Published last, with release ordering, and once per block rather than
+  // per sample: a reader that sees the new count is guaranteed the samples
+  // behind it are already in the ring.
+  write_pos_.store(start + packed, std::memory_order_release);
+  this->wake_clients_();
+}
+
+int AudioStream::claim_wake_slot_() {
+  int slot = -1;
+  const TaskHandle_t me = xTaskGetCurrentTaskHandle();
+  portENTER_CRITICAL(&wake_mux_);
+  for (int i = 0; i < kMaxClientSlots; i++) {
+    if (wake_[i] == nullptr) {
+      wake_[i] = me;
+      slot = i;
+      break;
+    }
+  }
+  portEXIT_CRITICAL(&wake_mux_);
+  return slot;
+}
+
+void AudioStream::release_wake_slot_(int slot) {
+  if (slot < 0)
+    return;
+  portENTER_CRITICAL(&wake_mux_);
+  wake_[slot] = nullptr;
+  portEXIT_CRITICAL(&wake_mux_);
+}
+
+// From the capture task, after each block lands. The handles are copied out
+// under the spinlock and notified outside it: a scheduler call inside a
+// critical section is not something to do from the audio path.
+void AudioStream::wake_clients_() {
+  TaskHandle_t handles[kMaxClientSlots];
+  portENTER_CRITICAL(&wake_mux_);
+  memcpy(handles, wake_, sizeof(handles));
+  portEXIT_CRITICAL(&wake_mux_);
+  for (auto h : handles)
+    if (h != nullptr)
+      xTaskNotifyGive(h);
 }
 
 void AudioStream::accept_loop() {
@@ -271,16 +373,60 @@ void AudioStream::client_loop(int fd) {
   bool ok = ::send(fd, head, head_len, 0) == head_len &&
             ::send(fd, hdr, sizeof(hdr), 0) == (int) sizeof(hdr);
 
-  auto *out = static_cast<uint8_t *>(
-      heap_caps_malloc(kChunkSamples * 3, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-  if (out == nullptr)
-    out = static_cast<uint8_t *>(heap_caps_malloc(kChunkSamples * 3, MALLOC_CAP_8BIT));
-  if (out == nullptr)
-    ok = false;
+  // A client that takes the stream as-is sends straight from the ring. The
+  // others convert into a buffer of their own, in internal RAM: it is small
+  // and written a byte at a time, which is the worst access pattern for
+  // PSRAM and the one the ring itself avoids by being memcpy'd into.
+  const bool passthrough = gain == 1.0f && bits_ == 24;
+  uint8_t *out = nullptr;
+  if (!passthrough) {
+    out = static_cast<uint8_t *>(
+        heap_caps_malloc(kChunkSamples * 3, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (out == nullptr)
+      out = static_cast<uint8_t *>(heap_caps_malloc(kChunkSamples * 3, MALLOC_CAP_8BIT));
+    if (out == nullptr)
+      ok = false;
+  }
+
+  // Sends a byte range, riding out the stalls. Returns false when the client
+  // is gone or has stalled too long.
+  auto send_all = [&](const uint8_t *buf, uint32_t len) -> bool {
+    uint32_t sent = 0;
+    uint8_t stalls = 0;
+    while (sent < len) {
+      const int got = ::send(fd, buf + sent, len - sent, 0);
+      if (got > 0) {
+        sent += got;
+        stalls = 0;
+        continue;
+      }
+      // A send that cannot proceed right now is not a dead client. On WiFi the
+      // window closes for a moment all the time, and SO_SNDTIMEO turns that
+      // into EAGAIN. Treating it as fatal closed the stream mid-listen - the
+      // symptom being a player reporting the stream ended, rather than a gap.
+      // Keep the ring filling and try again; the reader catches up afterwards,
+      // or falls far enough behind that the drop logic below skips it forward.
+      if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+        if (++stalls > kMaxStalls) {
+          ESP_LOGW(TAG, "client stalled for %u s; dropping it",
+                   (unsigned) (kMaxStalls * kStallWaitMs / 1000));
+          return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(kStallWaitMs));
+        continue;
+      }
+      ESP_LOGI(TAG, "client send failed: errno %d", errno);
+      return false;
+    }
+    return true;
+  };
+
+  const int wake_slot = this->claim_wake_slot_();
 
   // Start at the live edge rather than replaying the buffer.
   uint32_t read_pos = write_pos_.load(std::memory_order_acquire);
   uint32_t dropped = 0;
+  uint32_t behind_events = 0, behind_logged_ms = 0;
   // The writer keeps going while a chunk is being copied out, so a reader
   // within one chunk of being lapped would copy samples as they are being
   // overwritten. Treat that as already behind.
@@ -297,70 +443,53 @@ void AudioStream::client_loop(int fd) {
       dropped += available - capacity_ / 2;
       read_pos = head_pos - capacity_ / 2;
       available = capacity_ / 2;
-      ESP_LOGW(TAG, "client behind; dropped %u samples", (unsigned) dropped);
+      // A client that is persistently slow would otherwise log on every
+      // pass. Say so once, then at most every few seconds with the count.
+      const uint32_t now = millis();
+      behind_events++;
+      if (behind_logged_ms == 0 || now - behind_logged_ms >= kBehindLogMs) {
+        ESP_LOGW(TAG, "client behind (%u times); dropped %u samples", (unsigned) behind_events,
+                 (unsigned) dropped);
+        behind_logged_ms = now;
+      }
     }
     if (available == 0) {
-      vTaskDelay(pdMS_TO_TICKS(10));
+      // Sleep until push() lands a block. The timeout is a backstop, not the
+      // cadence: a notification a block ago that this loop consumed already
+      // is not lost, it just makes the next take return at once.
+      if (wake_slot >= 0)
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
+      else
+        vTaskDelay(pdMS_TO_TICKS(10));
       continue;
     }
 
     const uint32_t n = std::min(available, kChunkSamples);
-    uint32_t offset = read_pos % capacity_;
-    uint32_t written = 0;
-    for (uint32_t i = 0; i < n; i++) {
-      int32_t s = ring_[offset];
-      if (gain != 1.0f) {
-        // Saturate rather than wrap: a wrapped sample is a full-scale click,
-        // which is both unpleasant and looks like an event to a detector.
-        const float amplified = (float) s * gain;
-        s = amplified > 8388607.0f    ? 8388607
-            : amplified < -8388608.0f ? -8388608
-                                      : (int32_t) amplified;
-      }
-      if (bits_ == 16) {
-        const int16_t v = (int16_t) (s >> 8);  // 24-bit payload down to 16
-        out[written++] = (uint8_t) (v & 0xFF);
-        out[written++] = (uint8_t) ((v >> 8) & 0xFF);
-      } else {
-        out[written++] = (uint8_t) (s & 0xFF);
-        out[written++] = (uint8_t) ((s >> 8) & 0xFF);
-        out[written++] = (uint8_t) ((s >> 16) & 0xFF);
-      }
-      offset = offset + 1 == capacity_ ? 0 : offset + 1;
-    }
-
-    uint32_t sent = 0;
-    uint8_t stalls = 0;
-    while (sent < written) {
-      const int got = ::send(fd, out + sent, written - sent, 0);
-      if (got > 0) {
-        sent += got;
-        stalls = 0;
-        continue;
-      }
-      // A send that cannot proceed right now is not a dead client. On WiFi the
-      // window closes for a moment all the time, and SO_SNDTIMEO turns that
-      // into EAGAIN. Treating it as fatal closed the stream mid-listen - the
-      // symptom being a player reporting the stream ended, rather than a gap.
-      // Keep the ring filling and try again; the reader catches up afterwards,
-      // or falls far enough behind that the drop logic above skips it forward.
-      if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
-        if (++stalls > kMaxStalls) {
-          ESP_LOGW(TAG, "client stalled for %u s; dropping it",
-                   (unsigned) (kMaxStalls * kStallWaitMs / 1000));
-          ok = false;
-          break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(kStallWaitMs));
-        continue;
-      }
-      ESP_LOGI(TAG, "client send failed: errno %d", errno);
-      ok = false;
-      break;
+    const uint32_t offset = read_pos % capacity_;
+    if (passthrough) {
+      // At most two runs, where the chunk wraps the ring's end. send() copies
+      // out of the ring into lwIP's buffers; if the client stalls so long
+      // that the writer laps this region mid-copy, that chunk is garbled, but
+      // a stall that long is already a chunk the drop logic above is about
+      // to skip past, so nothing is lost that was going to arrive intact.
+      const uint32_t first = std::min(n, capacity_ - offset);
+      ok = send_all(ring_ + 3u * offset, 3u * first);
+      if (ok && first < n)
+        ok = send_all(ring_, 3u * (n - first));
+    } else {
+      uint32_t written;
+      if (gain != 1.0f && bits_ == 16)
+        written = convert<true, true>(ring_, capacity_, offset, n, gain, out);
+      else if (gain != 1.0f)
+        written = convert<true, false>(ring_, capacity_, offset, n, gain, out);
+      else
+        written = convert<false, true>(ring_, capacity_, offset, n, gain, out);
+      ok = send_all(out, written);
     }
     read_pos += n;
   }
 
+  this->release_wake_slot_(wake_slot);
   if (out != nullptr)
     free(out);
   ::close(fd);
