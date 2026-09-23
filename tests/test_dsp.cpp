@@ -187,6 +187,104 @@ static void test_harmonics() {
   CHECK(to_db(h5.excess_power) - to_db(fund.excess_power) < -30.0f, "H5 should be absent");
 }
 
+static void test_robust_spread() {
+  printf("robust spread: one frame that lost the tone does not ruin the interval\n");
+  // Six frames holding 700 Hz to within a hertz, one frame off in the noise.
+  const float peaks[7] = {700.1f, 700.4f, 699.8f, 700.2f, 700.0f, 699.7f, 741.3f};
+  float scratch[7];
+  auto r = robust_spread(peaks, 7, 3.0f, scratch);
+  // The standard deviation of the same seven, for comparison.
+  double mean = 0, sq = 0;
+  for (float p : peaks)
+    mean += p;
+  mean /= 7;
+  for (float p : peaks)
+    sq += (p - mean) * (p - mean);
+  printf("  median %.2f Hz  robust spread %.2f Hz  agreement %.0f%%  (standard deviation %.1f Hz)\n",
+         r.median, r.spread, 100 * r.agreement, sqrt(sq / 6));
+  CHECK(fabsf(r.median - 700.1f) < 0.01f, "median %.2f", r.median);
+  CHECK(r.spread < 1.0f, "robust spread %.2f should ignore the outlier", r.spread);
+  CHECK(fabsf(r.agreement - 6.0f / 7.0f) < 1e-4f, "agreement %.3f", r.agreement);
+  CHECK(sqrt(sq / 6) > 10.0, "the standard deviation should have been ruined, else no point");
+
+  // Gaussian scatter: the scaled MAD reads as the standard deviation would.
+  std::mt19937 rng(3);
+  std::normal_distribution<float> g(700.0f, 2.0f);
+  std::vector<float> many(2000), sc(2000);
+  for (auto &v : many)
+    v = g(rng);
+  auto big = robust_spread(many.data(), many.size(), 3.0f, sc.data());
+  printf("  2000 Gaussian peaks with sd 2.0: robust spread %.2f Hz\n", big.spread);
+  CHECK(fabsf(big.spread - 2.0f) < 0.15f, "scaled MAD %.2f should read ~2.0", big.spread);
+  auto two = robust_spread(peaks, 1, 3.0f, scratch);
+  CHECK(std::isnan(two.spread), "one value has no spread");
+  auto even = robust_spread(peaks, 4, 3.0f, scratch);
+  CHECK(fabsf(even.median - 700.15f) < 0.01f, "even-count median %.3f", even.median);
+}
+
+static void test_zoom_second_line_and_beat() {
+  printf("zoom: a beating pair shows two lines and a modulation at their separation\n");
+  const float fs = 48000;
+  // Noise at a level that gives the main FFT about 14 dB of prominence, the
+  // node's overnight operating point, with the pair drifting independently.
+  auto pair = synth(fs, 30, {{700.0f, -90, 1.2f, 25.0f}, {701.6f, -91, 1.0f, 31.0f}}, -65);
+  ZoomFFT z;
+  z.set_modulation_range(0.5f, 5.0f);
+  z.configure(fs, 650, 760, 1024);
+  int frames = 0, two_lines = 0, beat_at_sep = 0;
+  float min_mod_prom = 1e9f;
+  uint32_t seq = 0;
+  for (float v : pair)
+    if (z.push(v) && z.result().seq != seq) {
+      seq = z.result().seq;
+      const auto &r = z.result();
+      const float sep = fabsf(r.second_hz - r.peak_hz);
+      if (frames < 3)
+        printf("  pair:   lines %.2f / %.2f Hz (sep %.2f)  modulation %.2f Hz  %.0f dB  depth %.0f%%\n",
+               r.peak_hz, r.second_hz, sep, r.modulation_hz, r.modulation_prominence_db,
+               100 * r.modulation_depth);
+      frames++;
+      if (sep > 0.8f && sep < 2.4f)
+        two_lines++;
+      if (fabsf(r.modulation_hz - sep) < 0.5f)
+        beat_at_sep++;
+      min_mod_prom = std::min(min_mod_prom, r.modulation_prominence_db);
+    }
+  printf("  %d frames: two lines 0.8-2.4 Hz apart in %d, modulation at their separation in %d, "
+         "modulation prominence >= %.1f dB\n",
+         frames, two_lines, beat_at_sep, min_mod_prom);
+  CHECK(frames >= 6, "too few frames");
+  CHECK(two_lines >= frames - 1, "second line not found reliably");
+  CHECK(beat_at_sep >= frames - 1, "modulation frequency does not match the line separation");
+  CHECK(min_mod_prom > 10.0f, "beat should be clearly prominent");
+
+  printf("zoom: a single tone at the same SNR does not\n");
+  auto single = synth(fs, 30, {{700.0f, -87, 1.2f, 25.0f}}, -65);
+  ZoomFFT s;
+  s.set_modulation_range(0.5f, 5.0f);
+  s.configure(fs, 650, 760, 1024);
+  frames = 0;
+  float max_mod_prom = -1e9f, max_second = -1e9f;
+  seq = 0;
+  for (float v : single)
+    if (s.push(v) && s.result().seq != seq) {
+      seq = s.result().seq;
+      const auto &r = s.result();
+      if (frames < 3)
+        printf("  single: lines %.2f / %.2f Hz  modulation %.2f Hz  %.0f dB  depth %.0f%%\n", r.peak_hz,
+               r.second_hz, r.modulation_hz, r.modulation_prominence_db, 100 * r.modulation_depth);
+      frames++;
+      max_mod_prom = std::max(max_mod_prom, r.modulation_prominence_db);
+      max_second = std::max(max_second, r.second_prominence_db - r.prominence_db);
+    }
+  printf("  %d frames: modulation prominence <= %.1f dB, second line at most %.1f dB relative to the first\n",
+         frames, max_mod_prom, max_second);
+  CHECK(max_mod_prom < 10.0f, "single tone should show no clear modulation");
+  // The strongest of ~700 noise bins sits 10-13 dB over the median on its
+  // own; the tone at this SNR sits ~25 dB over it.
+  CHECK(max_second < -10.0f, "single tone's second line should be far below the first");
+}
+
 // ------------------------------------------------------------ real clip ----
 
 static bool read_wav24(const char *path, std::vector<float> &x, float &fs) {
@@ -275,6 +373,8 @@ int main(int argc, char **argv) {
   test_zoom_alias_rejection();
   test_zoom_retune();
   test_harmonics();
+  test_robust_spread();
+  test_zoom_second_line_and_beat();
   if (argc > 1)
     real_clip(argv[1]);
   printf(failures ? "\n%d FAILED\n" : "\nall passed\n", failures);

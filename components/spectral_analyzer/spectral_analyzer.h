@@ -21,9 +21,12 @@
 namespace esphome {
 namespace spectral_analyzer {
 
-// One harmonic of a band's tone, measured at order x the band's peak.
+// One harmonic of a band's tone, measured at order x the band's peak. Orders
+// below 1 look under the tone: a fan's blade-pass line sits over a shaft
+// line at f0 / blades, and a targeted, gated search at f0 x 0.2 is more
+// sensitive than the discovery scan is down in the rumble.
 struct Harmonic {
-  uint8_t order;
+  float order;
   sensor::Sensor *relative{nullptr};    // dB, power relative to the fundamental
   sensor::Sensor *prominence{nullptr};  // dB over the local floor at n x f0
   sensor::Sensor *frequency{nullptr};   // Hz, where it actually is
@@ -41,19 +44,32 @@ struct Band {
   // narrow tone this is the honest detection metric: `snr` sums the band's
   // whole width, so one 1.46 Hz tone in a 110 Hz band is averaged away.
   sensor::Sensor *prominence{nullptr};
-  // Hz, standard deviation of the per-frame peak across the interval. A tone
-  // holds its frequency while its level fades; noise does not. Measured
-  // indoors: 1.96 Hz for this source, against ~30 Hz for the band's width.
+  // Hz, robust spread of the per-frame peak across the interval (1.4826 x
+  // the median absolute deviation, which reads as a standard deviation would
+  // for Gaussian scatter and shrugs off the one frame that lost the tone to
+  // noise). A tone holds its frequency while its level fades; noise does not.
+  // Measured indoors: 1.96 Hz for this source, against ~30 Hz for the band's
+  // width. See dsp::robust_spread for why it is not the standard deviation.
   sensor::Sensor *stability{nullptr};
+  // %, frames whose peak fell within +/- agreement_tol_hz of the interval's
+  // median peak. 100 is a tone; noise scatters across the band and reads
+  // near 100 x (2 x tol / band width).
+  sensor::Sensor *agreement{nullptr};
+  float agreement_tol_hz{3.0f};
+  // dB, robust spread of the per-frame peak level. Puts a number on a source
+  // that fades irregularly, and separates a steady source from a throbbing one.
+  sensor::Sensor *level_spread{nullptr};
 
-  // Per-frame peak statistics, written by the capture task under the channel
-  // lock and drained by update(). Welford would be tidier; sums are enough at
-  // these counts and cost less in the audio path.
-  double peak_sum{0.0}, peak_sq{0.0};
-  uint32_t peak_n{0};
-  // Drained result, computed under the lock so update() never reads the sums
-  // while the capture task is adding to them. NaN until enough frames.
+  // Per-frame peak frequency and level, written by the capture task under
+  // the channel lock and drained by update(). Sized at setup for one update
+  // interval; frames beyond that are counted but not stored.
+  std::vector<float> frame_hz, frame_db;
+  uint32_t frame_n{0};
+  // Drained results, computed under the lock so update() never reads the
+  // arrays while the capture task is adding to them. NaN until enough frames.
   float stability_hz{NAN};
+  float agreement_frac{NAN};
+  float level_spread_db{NAN};
 
   // Harmonics of the band's peak. A motor, transformer or pump has a series;
   // a whistle or an acoustic resonance mostly does not.
@@ -67,6 +83,12 @@ struct Band {
   uint32_t zoom_fft_size{0};
   sensor::Sensor *zoom_peak{nullptr};
   sensor::Sensor *zoom_prominence{nullptr};
+  sensor::Sensor *zoom_second_peak{nullptr};
+  sensor::Sensor *zoom_second_prominence{nullptr};
+  sensor::Sensor *zoom_mod_hz{nullptr};
+  sensor::Sensor *zoom_mod_prominence{nullptr};
+  sensor::Sensor *zoom_mod_depth{nullptr};
+  float zoom_mod_lo{0.5f}, zoom_mod_hi{5.0f};
   dsp::ZoomFFT::Result zoom_latest;  // copied out under zoom_mux_
   uint32_t zoom_published{0};  // last Result::seq sent, so a frame publishes once
 };
@@ -97,6 +119,10 @@ struct SpectrumChannel {
 
   SemaphoreHandle_t lock{nullptr};
   uint32_t frames{0};
+  std::vector<float> scratch;   // for the robust statistics, main loop only
+  // Added to every absolute level (rms, floor, band level). Zero publishes
+  // dBFS; 120 turns an ICS-43434's -26 dBFS at 94 dB SPL into dB SPL.
+  float level_offset_db{0.0f};
 
   sensor::Sensor *rms{nullptr};
   sensor::Sensor *floor{nullptr};
@@ -125,9 +151,11 @@ class SpectralAnalyzer : public PollingComponent {
   void set_fft_size(uint32_t n) { air_.fft_size = n; }
   void set_rms_sensor(sensor::Sensor *s) { air_.rms = s; }
   void set_floor_sensor(sensor::Sensor *s) { air_.floor = s; }
+  void set_level_offset(float db) { air_.level_offset_db = db; }
   void add_band(const std::string &name, float lo, float hi, sensor::Sensor *level,
                 sensor::Sensor *snr, sensor::Sensor *peak, sensor::Sensor *prominence,
-                sensor::Sensor *stability) {
+                sensor::Sensor *stability, sensor::Sensor *agreement,
+                sensor::Sensor *level_spread) {
     Band b;
     b.name = name;
     b.f_low = lo;
@@ -137,23 +165,36 @@ class SpectralAnalyzer : public PollingComponent {
     b.peak = peak;
     b.prominence = prominence;
     b.stability = stability;
+    b.agreement = agreement;
+    b.level_spread = level_spread;
     air_.bands.push_back(b);
   }
   // These act on the band added last, so codegen calls them straight after
   // add_band().
+  void set_agreement_tolerance(float hz) { air_.bands.back().agreement_tol_hz = hz; }
   void set_harmonic_params(float tol_hz, float min_prom) {
     air_.bands.back().harmonic_tol_hz = tol_hz;
     air_.bands.back().harmonic_min_prom = min_prom;
   }
-  void add_harmonic(uint8_t order, sensor::Sensor *relative, sensor::Sensor *prominence,
+  void add_harmonic(float order, sensor::Sensor *relative, sensor::Sensor *prominence,
                     sensor::Sensor *frequency) {
     air_.bands.back().harmonics.push_back({order, relative, prominence, frequency});
   }
-  void set_zoom(uint32_t fft_size, sensor::Sensor *peak, sensor::Sensor *prominence) {
+  void set_zoom(uint32_t fft_size, sensor::Sensor *peak, sensor::Sensor *prominence,
+                sensor::Sensor *second_peak, sensor::Sensor *second_prominence,
+                sensor::Sensor *mod_hz, sensor::Sensor *mod_prominence, sensor::Sensor *mod_depth,
+                float mod_lo, float mod_hi) {
     Band &b = air_.bands.back();
     b.zoom_fft_size = fft_size;
     b.zoom_peak = peak;
     b.zoom_prominence = prominence;
+    b.zoom_second_peak = second_peak;
+    b.zoom_second_prominence = second_prominence;
+    b.zoom_mod_hz = mod_hz;
+    b.zoom_mod_prominence = mod_prominence;
+    b.zoom_mod_depth = mod_depth;
+    b.zoom_mod_lo = mod_lo;
+    b.zoom_mod_hi = mod_hi;
   }
 
   // ----------------------------------------------------- spectrum scan
@@ -240,7 +281,10 @@ class SpectralAnalyzer : public PollingComponent {
   float scan_f_low_{20.0f}, scan_f_high_{0.0f};  // 0 means up to Nyquist
   // Carries seen-counts between scans so a source that runs for an hour is
   // distinguishable from a door slam that happened to land in one scan.
-  void age_peaks_(float bin_hz);
+  // Ages the full candidate list, not just the top N that get reported, so
+  // a steady source that one loud transient pushed out of the top N for a
+  // scan keeps its count.
+  void age_peaks_(std::vector<SpectrumPeak> &candidates, float bin_hz);
 
   uint32_t last_scan_ms_{0};
   uint8_t scan_persist_{2};  // scans a peak must survive before it is "steady"

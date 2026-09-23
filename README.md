@@ -68,11 +68,27 @@ noisy band, because both average the whole band width, so one 1.46 Hz tone in a
 - **`peak_prominence`**: the strongest bin against the band's *median*, so a
   narrow tone measures itself against the noise it sits in. Typically 10 dB
   more sensitive than SNR on the same signal.
-- **`peak_stability`**: the standard deviation of the per-frame peak
-  frequency. This is the one that settles arguments. A tone holds its frequency
-  while its level fades; noise does not. Measured on real sources: 0.2 to 1 Hz
-  for a machine, 13 to 48 Hz for a lump in the noise floor. Two candidates that looked
+- **`peak_stability`**: the spread of the per-frame peak frequency. This is
+  the one that settles arguments. A tone holds its frequency while its level
+  fades; noise does not. Measured on real sources: 0.2 to 1 Hz for a machine,
+  13 to 48 Hz for a lump in the noise floor. Two candidates that looked
   convincing on prominence alone were disqualified this way.
+
+  It is a robust spread, 1.4826 times the median absolute deviation, which
+  reads the same as a standard deviation for ordinary scatter and ignores the
+  odd frame. It was a standard deviation first, and that failed exactly where
+  it was needed: a marginal tone at 8-10 dB loses its band peak to noise in
+  one frame out of seven, that frame lands 40 Hz away, and the six frames
+  that held still read 15 Hz. In a night of 375 intervals the weak-tone
+  branch of the detector below never fired once. Simulated at 8 dB per
+  frame, the standard deviation stays under 4 Hz 9% of the time; the robust
+  spread, 79%.
+- **`peak_agreement`**: percent of frames whose peak sits within
+  `agreement_tolerance` (default 3 Hz) of the interval's median peak. The
+  blunt companion: 100 is a tone, noise reads about 2 x tolerance / band
+  width.
+- **`peak_level_spread`**: robust spread of the per-frame peak level, in dB.
+  A steady source reads about a decibel; one that fades or throbs reads more.
 
 A detector that uses both survives a source that fades:
 
@@ -95,12 +111,22 @@ Prominence is measured against a *local* median computed in ~150 Hz blocks, so
 a faint whine in a quiet region outranks loud broadband hiss. This is how you
 find what to point a band at.
 
+Persistence counts are carried on the full candidate list (up to 64 peaks
+over `min_prominence`), not just the `top_n` that get reported, so a steady
+source that a passing car pushed out of the top eight for one scan is still
+`*` when it comes back. Peaks are matched to the previous scan within 1.5% of
+their frequency (at least 6 Hz), which covers a drifting source; a fixed
+few-bin tolerance undercounted a 700 Hz line that wanders more than that.
+
 ## Harmonics
 
 A machine rarely makes one line. A motor, transformer, pump or fan has a
 series at 2x, 3x, 4x its fundamental; a whistle, a resonance or a tuned
 alarm mostly does not. `harmonics` measures that series at order x the band's
-own peak:
+own peak. Orders below 1 look under it: a fan's blade-pass tone sits over a
+shaft line at f0 / blades, so `order: 0.2` on a 700 Hz line tests for a
+5-blade fan at 140 Hz, and a gated search there is more sensitive than the
+discovery scan is down in the rumble.
 
 ```yaml
     - name: tone700
@@ -175,6 +201,46 @@ What it costs is time, and that is the thing to decide on:
 - **Frames are longer than `update_interval`**, so a zoom publishes once per
   frame, when it lands, and most intervals publish nothing. Frames overlap by
   half. The config validator refuses a frame over 60 s.
+
+### Two lines, and the beat between them
+
+A zoom frame also reports the **second strongest separate line** in the band
+(`second_peak_frequency`, `second_peak_prominence`, at least four bins from
+the first) and the **periodic modulation of the band's envelope**
+(`modulation_frequency`, `modulation_prominence`, `modulation_depth`,
+searched over `modulation_f_low`..`modulation_f_high`, default 0.5-5 Hz).
+
+The decimated baseband is the band's analytic signal, so its power is the
+envelope, and the spectrum of that envelope over the frame is where a throb
+shows up. This is the test for two similar machines running side by side:
+two tones df apart beat at exactly df, so two lines whose separation equals
+the modulation frequency, frame after frame, is beating. One source gives one
+line, a second line in the noise at a random frequency each frame, and a
+modulation peak of a few dB at a random frequency.
+
+Simulated at a main-FFT prominence of 14 dB, a real node's overnight
+operating point, with the pair drifting independently:
+
+| | second line | modulation |
+|---|---|---|
+| pair 1.6 Hz apart | 1.4-1.8 Hz from the first, every frame | at the separation, 11-17 dB |
+| one tone | 50 Hz away, then 36, then 27 | 4-7 dB, random frequency |
+
+`modulation_depth` is the modulation index of a sinusoidal power modulation,
+in percent: 100 for two equal tones. It reads low when the beat rate itself
+changes inside a frame, which independently drifting tones do, so treat it
+as a floor.
+
+```yaml
+      zoom:
+        fft_size: 1024
+        second_peak_frequency:
+          name: "Tone 700 zoom second peak"
+        modulation_frequency:
+          name: "Tone 700 modulation"
+        modulation_prominence:
+          name: "Tone 700 modulation prominence"
+```
 
 Zooms follow their band when it is retuned at runtime. The filter runs in the
 capture task at about 19 multiply-adds per input sample for a 110 Hz band,
@@ -292,7 +358,11 @@ The noise floor improved 2 to 3 dB as well.
 ## Conventions
 
 - A full-scale sine reads **-3.01 dBFS**, the RMS convention.
-- Levels are dBFS, not dB SPL. Absolute SPL needs a calibrated reference.
+- Levels are dBFS unless `level_offset` is set. It is added to the broadband,
+  floor and band levels only; ratios are unchanged. An ICS-43434 reads
+  -26 dBFS at 94 dB SPL, so `level_offset: 120` publishes dB SPL through the
+  microphone's nominal sensitivity, which is within a couple of dB of a
+  calibrated reference and nowhere near it above 2 kHz behind a port.
 - Bands of equal width give comparable stability figures; a peak needs room to
   wander before the band edges clip it.
 

@@ -19,6 +19,13 @@ using dsp::fft;
 using dsp::interpolate_peak;
 using dsp::kTiny;
 using dsp::median_bin_power;
+using dsp::robust_spread;
+
+static bool valid_range(float f_low, float f_high) {
+  // Written so that NaN fails: NaN compares false against everything, and a
+  // NaN range would otherwise be accepted, saved to flash and cast to a bin.
+  return f_low >= 0.0f && f_high > f_low;
+}
 
 // Large buffers go to PSRAM when present (the ESP32-P4 board has 32 MB), and
 // fall back to internal RAM so smaller FFT sizes still work without it.
@@ -109,7 +116,7 @@ void SpectrumChannel::accumulate_frame() {
 void SpectrumChannel::track_frame_peaks(const float *frame_psd) {
   const float bin_hz = (float) sample_rate / (float) fft_size;
   for (auto &b : bands) {
-    if (b.stability == nullptr)
+    if (b.stability == nullptr && b.agreement == nullptr && b.level_spread == nullptr)
       continue;
     const uint32_t k_lo = std::max<uint32_t>(1, (uint32_t) ceilf(b.f_low / bin_hz));
     const uint32_t k_hi = std::min<uint32_t>(half() - 1, (uint32_t) floorf(b.f_high / bin_hz));
@@ -119,10 +126,11 @@ void SpectrumChannel::track_frame_peaks(const float *frame_psd) {
     for (uint32_t k = k_lo; k <= k_hi; k++)
       if (frame_psd[k] > frame_psd[k_peak])
         k_peak = k;
-    const double f = (double) interpolate_peak(frame_psd, half(), k_peak) * bin_hz;
-    b.peak_sum += f;
-    b.peak_sq += f * f;
-    b.peak_n++;
+    if (b.frame_n < b.frame_hz.size()) {
+      b.frame_hz[b.frame_n] = interpolate_peak(frame_psd, half(), k_peak) * bin_hz;
+      b.frame_db[b.frame_n] = dsp::to_db(frame_psd[k_peak]);
+    }
+    b.frame_n++;
   }
 }
 
@@ -131,17 +139,17 @@ uint32_t SpectrumChannel::drain() {
     return 0;
   const uint32_t f = frames;
   // Spread of the per-frame peaks, then reset for the next interval. Needs two
-  // frames for a standard deviation to mean anything.
+  // frames for a spread to mean anything.
   for (auto &b : bands) {
-    if (b.peak_n >= 2) {
-      const double mean = b.peak_sum / (double) b.peak_n;
-      const double var = (b.peak_sq - b.peak_sum * mean) / (double) (b.peak_n - 1);
-      b.stability_hz = var > 0.0 ? (float) sqrt(var) : 0.0f;
-    } else {
-      b.stability_hz = NAN;
+    const uint32_t n = std::min<uint32_t>(b.frame_n, (uint32_t) b.frame_hz.size());
+    b.stability_hz = b.agreement_frac = b.level_spread_db = NAN;
+    if (n >= 2 && scratch.size() >= n) {
+      const dsp::Spread hz = robust_spread(b.frame_hz.data(), n, b.agreement_tol_hz, scratch.data());
+      b.stability_hz = hz.spread;
+      b.agreement_frac = hz.agreement;
+      b.level_spread_db = robust_spread(b.frame_db.data(), n, 0.0f, scratch.data()).spread;
     }
-    b.peak_sum = b.peak_sq = 0.0;
-    b.peak_n = 0;
+    b.frame_n = 0;
   }
   for (uint32_t k = 0; k < half(); k++) {
     psd_snapshot[k] = f > 0 ? psd_accum[k] / (float) f : 0.0f;
@@ -178,6 +186,20 @@ void SpectralAnalyzer::setup() {
              "DMA holds %u ms but one FFT takes about %u ms - audio will be lost silently. "
              "Raise dma_buffers on the audio source.",
              (unsigned) this->source_->dma_duration_ms(), (unsigned) fft_ms);
+
+  // One update interval of per-frame peaks per band, plus slack for where
+  // the frame boundaries fall. Sized here, before the capture task can see
+  // the bands, so the arrays are never resized under it.
+  const float frame_ms = 1000.0f * (float) this->air_.fft_size / (float) this->air_.sample_rate;
+  uint32_t per_interval = (uint32_t) ceilf((float) this->get_update_interval() / frame_ms) + 2;
+  per_interval = std::min<uint32_t>(512, std::max<uint32_t>(4, per_interval));
+  this->air_.scratch.assign(per_interval, 0.0f);
+  for (auto &b : this->air_.bands) {
+    if (b.stability == nullptr && b.agreement == nullptr && b.level_spread == nullptr)
+      continue;
+    b.frame_hz.assign(per_interval, 0.0f);
+    b.frame_db.assign(per_interval, 0.0f);
+  }
 
   this->band_defaults_.clear();
   for (auto &b : this->air_.bands)
@@ -247,11 +269,11 @@ void SpectralAnalyzer::on_audio(const int32_t *samples, uint32_t count) {
 // ------------------------------------------------------ runtime bands ----
 
 bool SpectralAnalyzer::set_band_range(const std::string &name, float f_low, float f_high) {
-  if (f_low >= f_high || f_low < 0.0f) {
+  const float nyquist = 0.5f * (float) this->air_.sample_rate;
+  if (!valid_range(f_low, f_high)) {
     ESP_LOGW(TAG, "ignoring band range %.1f-%.1f Hz", f_low, f_high);
     return false;
   }
-  const float nyquist = 0.5f * (float) this->air_.sample_rate;
   if (f_high >= nyquist) {
     ESP_LOGW(TAG, "band '%s' f_high %.1f Hz is at or above Nyquist (%.0f Hz)", name.c_str(),
              f_high, nyquist);
@@ -294,9 +316,8 @@ void SpectralAnalyzer::apply_range_(Band &b, float f_low, float f_high) {
     b.f_high = f_high;
     // The peak statistics describe the old range; keeping them would blend two
     // different bands into one stability figure.
-    b.peak_sum = b.peak_sq = 0.0;
-    b.peak_n = 0;
-    b.stability_hz = NAN;
+    b.frame_n = 0;
+    b.stability_hz = b.agreement_frac = b.level_spread_db = NAN;
     xSemaphoreGive(this->air_.lock);
   }
   if (b.zoom == nullptr)
@@ -314,6 +335,7 @@ void SpectralAnalyzer::apply_range_(Band &b, float f_low, float f_high) {
 }
 
 void SpectralAnalyzer::configure_zoom_(Band &b) {
+  b.zoom->set_modulation_range(b.zoom_mod_lo, b.zoom_mod_hi);
   b.zoom->configure((float) this->air_.sample_rate, b.f_low, b.f_high, b.zoom_fft_size);
   ESP_LOGI(TAG, "band '%s' zoom: %u points, %.3f Hz bins, %.1f s frames (D=%u, %u taps, %u kB)",
            b.name.c_str(), (unsigned) b.zoom_fft_size, b.zoom->bin_hz(), b.zoom->frame_s(),
@@ -343,9 +365,10 @@ void SpectralAnalyzer::restore_bands_() {
     ESP_LOGW(TAG, "saved band ranges are for a different configuration; ignoring them");
     return;
   }
+  const float nyquist = 0.5f * (float) this->air_.sample_rate;
   uint8_t moved = 0;
   for (uint8_t i = 0; i < blob.count; i++) {
-    if (blob.range[i][0] >= blob.range[i][1])
+    if (!valid_range(blob.range[i][0], blob.range[i][1]) || blob.range[i][1] >= nyquist)
       continue;
     if (blob.range[i][0] != this->air_.bands[i].f_low ||
         blob.range[i][1] != this->air_.bands[i].f_high)
@@ -375,16 +398,17 @@ void SpectralAnalyzer::update() {
   const uint32_t half = ch.half();
   const float bin_hz = (float) ch.sample_rate / (float) ch.fft_size;
 
+  const float offset = ch.level_offset_db;
   if (ch.rms != nullptr) {
     float total = 0.0f;
     for (uint32_t k = 1; k < half; k++)
       total += psd[k];
-    ch.rms->publish_state(10.0f * log10f(total + kTiny));
+    ch.rms->publish_state(10.0f * log10f(total + kTiny) + offset);
   }
 
   if (ch.floor != nullptr) {
     const float ref_floor = median_bin_power(psd, half, bin_hz, 300.0f, 2000.0f, 0.0f, 0.0f);
-    ch.floor->publish_state(10.0f * log10f(ref_floor + kTiny));
+    ch.floor->publish_state(10.0f * log10f(ref_floor + kTiny) + offset);
   }
 
   for (auto &b : ch.bands) {
@@ -402,7 +426,7 @@ void SpectralAnalyzer::update() {
     }
 
     if (b.level != nullptr)
-      b.level->publish_state(10.0f * log10f(band_power + kTiny));
+      b.level->publish_state(10.0f * log10f(band_power + kTiny) + offset);
 
     if (b.snr != nullptr) {
       // Floor measured beside the band, with a one-bandwidth guard either side.
@@ -419,6 +443,10 @@ void SpectralAnalyzer::update() {
 
     if (b.stability != nullptr && !std::isnan(b.stability_hz))
       b.stability->publish_state(b.stability_hz);
+    if (b.agreement != nullptr && !std::isnan(b.agreement_frac))
+      b.agreement->publish_state(100.0f * b.agreement_frac);
+    if (b.level_spread != nullptr && !std::isnan(b.level_spread_db))
+      b.level_spread->publish_state(b.level_spread_db);
 
     const bool need_prom = b.prominence != nullptr || !b.harmonics.empty();
     float prom_db = NAN;
@@ -454,6 +482,16 @@ void SpectralAnalyzer::update() {
           b.zoom_peak->publish_state(z.peak_hz);
         if (b.zoom_prominence != nullptr)
           b.zoom_prominence->publish_state(z.prominence_db);
+        if (b.zoom_second_peak != nullptr)
+          b.zoom_second_peak->publish_state(z.second_hz);
+        if (b.zoom_second_prominence != nullptr)
+          b.zoom_second_prominence->publish_state(z.second_prominence_db);
+        if (b.zoom_mod_hz != nullptr)
+          b.zoom_mod_hz->publish_state(z.modulation_hz);
+        if (b.zoom_mod_prominence != nullptr)
+          b.zoom_mod_prominence->publish_state(z.modulation_prominence_db);
+        if (b.zoom_mod_depth != nullptr)
+          b.zoom_mod_depth->publish_state(100.0f * z.modulation_depth);
       }
     }
   }
@@ -584,41 +622,55 @@ void SpectralAnalyzer::scan_spectrum_(const float *psd, uint32_t half, float bin
 
   // Spectral leakage puts skirts either side of a strong tone; keep only the
   // strongest peak within a few bins so one source reports as one line.
+  //
+  // The candidate list is kept longer than what is reported: seen-counts age
+  // against it, so a source that one transient pushed out of the top N for a
+  // scan is still "steady" when it comes back.
+  constexpr size_t kCandidates = 64;
   const float min_sep_hz = 4.0f * bin_hz;
-  std::vector<SpectrumPeak> kept;
-  kept.reserve(this->scan_top_n_);
+  std::vector<SpectrumPeak> candidates;
+  candidates.reserve(kCandidates);
   for (const auto &p : this->peaks_) {
     bool clash = false;
-    for (const auto &q : kept)
+    for (const auto &q : candidates)
       if (fabsf(p.freq_hz - q.freq_hz) < min_sep_hz) {
         clash = true;
         break;
       }
     if (clash)
       continue;
-    kept.push_back(p);
-    if (kept.size() >= this->scan_top_n_)
+    candidates.push_back(p);
+    if (candidates.size() >= kCandidates)
       break;
   }
-  this->peaks_.swap(kept);
-  this->age_peaks_(bin_hz);
+  this->age_peaks_(candidates, bin_hz);
+  if (candidates.size() > this->scan_top_n_)
+    candidates.resize(this->scan_top_n_);
+  this->peaks_.swap(candidates);
 }
 
-// Match this scan's peaks against the last one and carry the counts forward.
-// A tolerance of a few bins keeps a drifting source (this one wanders about
-// 5 Hz) matched to itself rather than reported as a new find every scan.
-void SpectralAnalyzer::age_peaks_(float bin_hz) {
-  const float tol_hz = std::max(4.0f * bin_hz, 6.0f);
-  for (auto &p : this->peaks_) {
+// Match this scan's candidates against the last scan's and carry the counts
+// forward. The tolerance follows the frequency: the 700 Hz source under
+// investigation has wandered 22 Hz within one clip, and a fixed few-bin
+// tolerance reset its count and undercounted how often it was there.
+void SpectralAnalyzer::age_peaks_(std::vector<SpectrumPeak> &candidates, float bin_hz) {
+  for (auto &p : candidates) {
+    const float tol_hz = std::max(std::max(4.0f * bin_hz, 6.0f), 0.015f * p.freq_hz);
+    // Nearest previous peak within tolerance, not the first one found.
+    const SpectrumPeak *best = nullptr;
+    float best_d = tol_hz;
     for (const auto &q : this->previous_peaks_) {
-      if (fabsf(p.freq_hz - q.freq_hz) <= tol_hz) {
-        // Saturate rather than wrap: a tone running for days stays "steady".
-        p.seen = q.seen < 65000 ? q.seen + 1 : q.seen;
-        break;
+      const float d = fabsf(p.freq_hz - q.freq_hz);
+      if (d <= best_d) {
+        best_d = d;
+        best = &q;
       }
     }
+    // Saturate rather than wrap: a tone running for days stays "steady".
+    if (best != nullptr)
+      p.seen = best->seen < 65000 ? best->seen + 1 : best->seen;
   }
-  this->previous_peaks_ = this->peaks_;
+  this->previous_peaks_ = candidates;
 }
 
 void SpectralAnalyzer::dump_config() {
@@ -635,19 +687,33 @@ void SpectralAnalyzer::dump_config() {
                         b.f_high != this->band_defaults_[i].f_high);
     ESP_LOGCONFIG(TAG, "    Band '%s': %.0f-%.0f Hz%s", b.name.c_str(), b.f_low, b.f_high,
                   moved ? "  (retuned at runtime)" : "");
+    if (b.agreement != nullptr) {
+      ESP_LOGCONFIG(TAG, "      Agreement within +/-%.1f Hz of the median peak", b.agreement_tol_hz);
+    }
     if (!b.harmonics.empty()) {
       std::string orders;
-      for (const auto &h : b.harmonics)
-        orders += (orders.empty() ? "" : ",") + std::to_string(h.order);
+      for (const auto &h : b.harmonics) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%s%g", orders.empty() ? "" : ",", h.order);
+        orders += buf;
+      }
       ESP_LOGCONFIG(TAG, "      Harmonics %s, +/-%.1f Hz per order, when prominence >= %.0f dB",
                     orders.c_str(), b.harmonic_tol_hz, b.harmonic_min_prom);
     }
-    if (b.zoom != nullptr)
+    if (b.zoom != nullptr) {
       ESP_LOGCONFIG(TAG, "      Zoom %u points: %.3f Hz bins, %.1f s frames, a result every %.1f s",
                     (unsigned) b.zoom_fft_size, b.zoom->bin_hz(), b.zoom->frame_s(),
                     0.5f * b.zoom->frame_s());
+      if (b.zoom_mod_hz != nullptr || b.zoom_mod_prominence != nullptr || b.zoom_mod_depth != nullptr) {
+        ESP_LOGCONFIG(TAG, "      Envelope modulation searched over %.2f-%.2f Hz", b.zoom_mod_lo,
+                      b.zoom_mod_hi);
+      }
+    }
   }
-  if (this->scan_interval_s_ > 0)
+  if (this->air_.level_offset_db != 0.0f) {
+    ESP_LOGCONFIG(TAG, "  Levels offset by %+.1f dB", this->air_.level_offset_db);
+  }
+  if (this->scan_interval_s_ > 0) {
     ESP_LOGCONFIG(TAG,
                   "  Spectrum scan: every %u s, top %u peaks, >= %.0f dB prominence, %.0f-%.0f Hz, "
                   "steady after %u scans",
@@ -656,6 +722,7 @@ void SpectralAnalyzer::dump_config() {
                   this->scan_f_high_ > 0.0f ? this->scan_f_high_
                                             : 0.5f * (float) this->air_.sample_rate,
                   (unsigned) this->scan_persist_);
+  }
 }
 
 }  // namespace spectral_analyzer

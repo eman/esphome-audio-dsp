@@ -8,6 +8,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
+#include <atomic>
 #include <cstdint>
 
 namespace esphome {
@@ -77,11 +78,17 @@ class AudioStream : public Component {
 
   int32_t *ring_{nullptr};
   uint32_t capacity_{0};  // samples
-  // Monotonic count of samples ever written. 64-bit so it never wraps: at
-  // 48 kHz a 32-bit counter would fold after about a day and glitch every
-  // client at the same moment.
-  volatile uint64_t write_pos_{0};
-  volatile uint32_t clients_{0};
+  // Count of samples ever written, modulo 2^32. It wraps after about a day
+  // at 48 kHz and that is fine: readers only ever compute (write - read) in
+  // unsigned arithmetic, which is exact across the wrap. A 64-bit counter was
+  // tried and is worse on a 32-bit core: the writer is on one core and the
+  // readers on the other, and a reader could see one half updated, which
+  // happened once per wrap of the low word, and skipped the client forward.
+  //
+  // Release/acquire so a reader that sees the new count also sees the samples
+  // behind it; the ring is in PSRAM on a dual-core part.
+  std::atomic<uint32_t> write_pos_{0};
+  std::atomic<uint32_t> clients_{0};
 };
 
 }  // namespace audio_stream

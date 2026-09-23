@@ -51,6 +51,17 @@ CONF_RELATIVE_LEVEL = "relative_level"
 CONF_PROMINENCE = "prominence"
 CONF_FREQUENCY = "frequency"
 CONF_ZOOM = "zoom"
+CONF_PEAK_AGREEMENT = "peak_agreement"
+CONF_AGREEMENT_TOLERANCE = "agreement_tolerance"
+CONF_PEAK_LEVEL_SPREAD = "peak_level_spread"
+CONF_LEVEL_OFFSET = "level_offset"
+CONF_SECOND_PEAK_FREQUENCY = "second_peak_frequency"
+CONF_SECOND_PEAK_PROMINENCE = "second_peak_prominence"
+CONF_MODULATION_FREQUENCY = "modulation_frequency"
+CONF_MODULATION_PROMINENCE = "modulation_prominence"
+CONF_MODULATION_DEPTH = "modulation_depth"
+CONF_MODULATION_F_LOW = "modulation_f_low"
+CONF_MODULATION_F_HIGH = "modulation_f_high"
 
 # A zoom frame longer than this is a minute of source behavior averaged into
 # one number; nothing this component looks at holds still that long.
@@ -124,6 +135,21 @@ def _db_relative_sensor():
     )
 
 
+def _percent_sensor():
+    return sensor.sensor_schema(
+        unit_of_measurement="%",
+        accuracy_decimals=0,
+        state_class=STATE_CLASS_MEASUREMENT,
+    )
+
+
+def _validate_order(value):
+    value = cv.float_range(min=0.02, max=32.0)(value)
+    if abs(value - 1.0) < 0.02:
+        raise cv.Invalid("order 1 is the fundamental itself; use 2 and up, or below 1")
+    return value
+
+
 def _validate_orders(orders):
     seen = [o[CONF_ORDER] for o in orders]
     if len(seen) != len(set(seen)):
@@ -146,7 +172,10 @@ HARMONICS_SCHEMA = cv.Schema(
             cv.ensure_list(
                 cv.Schema(
                     {
-                        cv.Required(CONF_ORDER): cv.int_range(min=2, max=32),
+                        # Integers look up the series; fractions look under
+                        # it. 0.2 on a 700 Hz line is the shaft of a 5-blade
+                        # fan. Tolerance scales with the order either way.
+                        cv.Required(CONF_ORDER): _validate_order,
                         cv.Optional(CONF_RELATIVE_LEVEL): _db_relative_sensor(),
                         cv.Optional(CONF_PROMINENCE): _db_sensor(),
                         cv.Optional(CONF_FREQUENCY): _hz_sensor(),
@@ -159,15 +188,36 @@ HARMONICS_SCHEMA = cv.Schema(
     }
 )
 
+def _validate_zoom(conf):
+    if conf[CONF_MODULATION_F_HIGH] <= conf[CONF_MODULATION_F_LOW]:
+        raise cv.Invalid(f"{CONF_MODULATION_F_HIGH} must be greater than {CONF_MODULATION_F_LOW}")
+    return conf
+
+
 # A high-resolution spectrum of this band alone; see dsp.h ZoomFFT.
-ZOOM_SCHEMA = cv.Schema(
-    {
-        cv.Optional(CONF_FFT_SIZE, default=2048): cv.one_of(
-            256, 512, 1024, 2048, 4096, 8192, 16384, int=True
-        ),
-        cv.Optional(CONF_PEAK_FREQUENCY): _hz_fine_sensor(),
-        cv.Optional(CONF_PEAK_PROMINENCE): _db_sensor(),
-    }
+ZOOM_SCHEMA = cv.All(
+    cv.Schema(
+        {
+            cv.Optional(CONF_FFT_SIZE, default=2048): cv.one_of(
+                256, 512, 1024, 2048, 4096, 8192, 16384, int=True
+            ),
+            cv.Optional(CONF_PEAK_FREQUENCY): _hz_fine_sensor(),
+            cv.Optional(CONF_PEAK_PROMINENCE): _db_sensor(),
+            # The second strongest separate line in the band. Two similar
+            # machines put two lines here; one machine puts noise here.
+            cv.Optional(CONF_SECOND_PEAK_FREQUENCY): _hz_fine_sensor(),
+            cv.Optional(CONF_SECOND_PEAK_PROMINENCE): _db_sensor(),
+            # Periodic modulation of the band's envelope: the throb. Two tones
+            # df apart beat at df, so modulation_frequency equal to the two
+            # lines' separation is the beating test, run every frame.
+            cv.Optional(CONF_MODULATION_FREQUENCY): _hz_sensor(),
+            cv.Optional(CONF_MODULATION_PROMINENCE): _db_sensor(),
+            cv.Optional(CONF_MODULATION_DEPTH): _percent_sensor(),
+            cv.Optional(CONF_MODULATION_F_LOW, default=0.5): cv.float_range(min=0.05, max=100.0),
+            cv.Optional(CONF_MODULATION_F_HIGH, default=5.0): cv.float_range(min=0.1, max=200.0),
+        }
+    ),
+    _validate_zoom,
 )
 
 
@@ -195,7 +245,16 @@ BAND_SCHEMA = cv.All(
             cv.Optional(CONF_PEAK_PROMINENCE): _db_sensor(),
             # Spread of the per-frame peak across the interval: small means a
             # tone is holding its frequency, regardless of how loud it is.
+            # Robust (scaled median absolute deviation), so one frame that
+            # lost the tone to noise does not read as a wandering peak.
             cv.Optional(CONF_PEAK_STABILITY): _hz_sensor(),
+            # Percent of frames whose peak sits within agreement_tolerance of
+            # the interval's median peak. The blunt companion to stability.
+            cv.Optional(CONF_PEAK_AGREEMENT): _percent_sensor(),
+            cv.Optional(CONF_AGREEMENT_TOLERANCE, default=3.0): cv.float_range(min=0.1, max=100.0),
+            # Robust spread of the per-frame peak level, in dB: a steady
+            # source reads ~1 dB, one that throbs or fades reads more.
+            cv.Optional(CONF_PEAK_LEVEL_SPREAD): _db_relative_sensor(),
             cv.Optional(CONF_HARMONICS): HARMONICS_SCHEMA,
             cv.Optional(CONF_ZOOM): ZOOM_SCHEMA,
         }
@@ -222,6 +281,21 @@ def _validate_with_rate(config, sr):
                     f"{band[CONF_F_HIGH] - band[CONF_F_LOW]:g} Hz band makes {frame_s:.0f} s "
                     f"frames ({sr / d / zoom[CONF_FFT_SIZE]:.3f} Hz bins); use a smaller "
                     f"{CONF_FFT_SIZE} or a wider band"
+                )
+            # The envelope spectrum shares the frame, so its bins are the
+            # same width; a search floor under two bins is looking at the DC
+            # skirt, and a ceiling above the decimated Nyquist is empty.
+            ebin = sr / d / zoom[CONF_FFT_SIZE]
+            if zoom[CONF_MODULATION_F_LOW] < 2 * ebin:
+                raise cv.Invalid(
+                    f"band '{band[CONF_NAME]}' zoom: {CONF_MODULATION_F_LOW} "
+                    f"{zoom[CONF_MODULATION_F_LOW]:g} Hz is under two envelope bins "
+                    f"({2 * ebin:.2f} Hz) for this frame; raise it or use a larger {CONF_FFT_SIZE}"
+                )
+            if zoom[CONF_MODULATION_F_HIGH] >= sr / d / 2:
+                raise cv.Invalid(
+                    f"band '{band[CONF_NAME]}' zoom: {CONF_MODULATION_F_HIGH} must be below "
+                    f"{sr / d / 2:.1f} Hz for this band's decimation"
                 )
     scan = config.get(CONF_SPECTRUM_SCAN)
     if scan is not None and scan[CONF_F_HIGH] >= nyquist:
@@ -252,6 +326,10 @@ CONFIG_SCHEMA = cv.All(
             ),
             cv.Optional(CONF_BROADBAND_RMS): _db_sensor(),
             cv.Optional(CONF_NOISE_FLOOR): _db_sensor(),
+            # Added to broadband, floor and band levels. 0 publishes dBFS.
+            # An ICS-43434 reads -26 dBFS at 94 dB SPL, so 120 publishes
+            # dB SPL. Ratios (SNR, prominence, relative) are unaffected.
+            cv.Optional(CONF_LEVEL_OFFSET, default=0.0): cv.float_range(min=-200.0, max=200.0),
             cv.Optional(CONF_BANDS, default=[]): cv.ensure_list(BAND_SCHEMA),
             cv.Optional(CONF_SPECTRUM_SCAN): SCAN_SCHEMA,
         }
@@ -279,6 +357,8 @@ async def to_code(config):
     await cg.register_component(var, config)
     cg.add(var.set_source(await cg.get_variable(config[CONF_SOURCE])))
     cg.add(var.set_fft_size(config[CONF_FFT_SIZE]))
+    if config[CONF_LEVEL_OFFSET] != 0.0:
+        cg.add(var.set_level_offset(config[CONF_LEVEL_OFFSET]))
 
     if CONF_BROADBAND_RMS in config:
         cg.add(var.set_rms_sensor(await sensor.new_sensor(config[CONF_BROADBAND_RMS])))
@@ -313,6 +393,16 @@ async def to_code(config):
             if CONF_PEAK_STABILITY in band
             else cg.nullptr
         )
+        agreement = (
+            await sensor.new_sensor(band[CONF_PEAK_AGREEMENT])
+            if CONF_PEAK_AGREEMENT in band
+            else cg.nullptr
+        )
+        level_spread = (
+            await sensor.new_sensor(band[CONF_PEAK_LEVEL_SPREAD])
+            if CONF_PEAK_LEVEL_SPREAD in band
+            else cg.nullptr
+        )
         cg.add(
             var.add_band(
                 band[CONF_NAME],
@@ -323,8 +413,12 @@ async def to_code(config):
                 peak,
                 prominence,
                 stability,
+                agreement,
+                level_spread,
             )
         )
+        if band[CONF_AGREEMENT_TOLERANCE] != 3.0:
+            cg.add(var.set_agreement_tolerance(band[CONF_AGREEMENT_TOLERANCE]))
         if CONF_HARMONICS in band:
             harm = band[CONF_HARMONICS]
             cg.add(var.set_harmonic_params(harm[CONF_TOLERANCE], harm[CONF_MIN_PROMINENCE]))
@@ -353,7 +447,24 @@ async def to_code(config):
                 if CONF_PEAK_PROMINENCE in zoom
                 else cg.nullptr
             )
-            cg.add(var.set_zoom(zoom[CONF_FFT_SIZE], zpeak, zprom))
+
+            async def opt(key):
+                return await sensor.new_sensor(zoom[key]) if key in zoom else cg.nullptr
+
+            cg.add(
+                var.set_zoom(
+                    zoom[CONF_FFT_SIZE],
+                    zpeak,
+                    zprom,
+                    await opt(CONF_SECOND_PEAK_FREQUENCY),
+                    await opt(CONF_SECOND_PEAK_PROMINENCE),
+                    await opt(CONF_MODULATION_FREQUENCY),
+                    await opt(CONF_MODULATION_PROMINENCE),
+                    await opt(CONF_MODULATION_DEPTH),
+                    zoom[CONF_MODULATION_F_LOW],
+                    zoom[CONF_MODULATION_F_HIGH],
+                )
+            )
 
 
 # ------------------------------------------------------------ actions

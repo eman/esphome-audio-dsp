@@ -26,9 +26,26 @@ void AudioSource::setup() {
     this->mark_failed();
     return;
   }
+}
+
+void AudioSource::loop() {
+  if (this->is_failed() || rx_chan_ == nullptr) {
+    this->disable_loop();
+    return;
+  }
+  // Every setup() has run by the time the first loop() is called, so the
+  // consumer list is complete and will not be reallocated under the task.
+  // Before this moved here the stream registered long after capture began,
+  // and its push_back reallocated the vector the capture task was iterating.
+  started_ = true;
   // Core 1: the network stack and ESPHome's main loop live on core 0, and
   // capture must not be preempted by them.
-  xTaskCreatePinnedToCore(capture_trampoline, "audio_source", 4096, this, 5, nullptr, 1);
+  if (xTaskCreatePinnedToCore(capture_trampoline, "audio_source", 4096, this, 5, nullptr, 1) !=
+      pdPASS) {
+    ESP_LOGE(TAG, "capture task creation failed");
+    this->mark_failed();
+  }
+  this->disable_loop();
 }
 
 bool AudioSource::start_i2s_() {
@@ -82,15 +99,17 @@ bool AudioSource::start_i2s_() {
     ESP_LOGE(TAG, "i2s_channel_init_std_mode failed: %s", esp_err_to_name(err));
     return false;
   }
-  err = i2s_channel_enable(rx_chan_);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "i2s_channel_enable failed: %s", esp_err_to_name(err));
-    return false;
-  }
   return true;
 }
 
 void AudioSource::capture_loop() {
+  // Enabled here rather than in setup so the DMA ring starts fresh when the
+  // reader does, instead of having overrun for the rest of boot.
+  const esp_err_t err = i2s_channel_enable(rx_chan_);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "i2s_channel_enable failed: %s", esp_err_to_name(err));
+    return;
+  }
   const size_t want = sizeof(int32_t) * block_size_;
   while (true) {
     size_t got = 0;

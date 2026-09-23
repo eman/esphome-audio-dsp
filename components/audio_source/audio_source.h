@@ -1,6 +1,7 @@
 #pragma once
 
 #include "esphome/core/component.h"
+#include "esphome/core/log.h"
 
 #ifdef USE_ESP_IDF
 
@@ -33,6 +34,11 @@ class AudioSource : public Component {
   using Consumer = std::function<void(const int32_t *samples, uint32_t count)>;
 
   void setup() override;
+  // Starts the capture task on the first call, which is after every
+  // component's setup() has run: consumers register during setup, and the
+  // vector they land in is never touched again once the task is iterating it.
+  // Registering a consumer after that would race the capture task.
+  void loop() override;
   void dump_config() override;
   // Ahead of DATA so consumers can register in their own setup().
   float get_setup_priority() const override { return setup_priority::IO; }
@@ -49,7 +55,13 @@ class AudioSource : public Component {
   void set_dma_frame_size(uint32_t n) { dma_frame_size_ = n; }
   void set_block_size(uint32_t n) { block_size_ = n; }
 
-  void add_consumer(Consumer c) { consumers_.push_back(std::move(c)); }
+  void add_consumer(Consumer c) {
+    if (started_) {
+      ESP_LOGE("audio_source", "consumer added after capture started; ignored");
+      return;
+    }
+    consumers_.push_back(std::move(c));
+  }
 
   uint32_t sample_rate() const { return sample_rate_; }
   uint32_t block_size() const { return block_size_; }
@@ -74,6 +86,7 @@ class AudioSource : public Component {
 
   i2s_chan_handle_t rx_chan_{nullptr};
   int32_t *block_{nullptr};
+  bool started_{false};
   std::vector<Consumer> consumers_;
 };
 

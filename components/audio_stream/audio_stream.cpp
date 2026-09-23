@@ -120,13 +120,14 @@ void AudioStream::push(const int32_t *samples, uint32_t n) {
       const int32_t v = (int32_t) (decim_acc_ / decim_);
       decim_acc_ = 0;
       decim_n_ = 0;
-      const uint32_t off = (uint32_t) (write_pos_ % capacity_);
-      ring_[off] = v;
-      write_pos_ += 1;
+      const uint32_t pos = write_pos_.load(std::memory_order_relaxed);
+      ring_[pos % capacity_] = v;
+      write_pos_.store(pos + 1, std::memory_order_release);
     }
     return;
   }
-  uint32_t offset = (uint32_t) (write_pos_ % capacity_);
+  const uint32_t start = write_pos_.load(std::memory_order_relaxed);
+  uint32_t offset = start % capacity_;
   uint32_t remaining = n;
   const int32_t *src = samples;
   while (remaining > 0) {
@@ -136,9 +137,9 @@ void AudioStream::push(const int32_t *samples, uint32_t n) {
     remaining -= run;
     offset = (offset + run) % capacity_;
   }
-  // Published last: a reader that sees the new count is guaranteed the samples
-  // behind it are already in the ring.
-  write_pos_ += n;
+  // Published last, with release ordering: a reader that sees the new count
+  // is guaranteed the samples behind it are already in the ring.
+  write_pos_.store(start + n, std::memory_order_release);
 }
 
 void AudioStream::accept_loop() {
@@ -176,13 +177,16 @@ void AudioStream::accept_loop() {
     if (fd < 0)
       continue;
 
-    if (clients_ >= max_clients_) {
+    // Counted here, by the one task that admits clients, so two arrivals
+    // cannot both pass the check; the client task counts itself out.
+    if (clients_.load() >= max_clients_) {
       static const char kBusy[] = "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n";
       ::send(fd, kBusy, sizeof(kBusy) - 1, 0);
       ::close(fd);
-      ESP_LOGW(TAG, "refused a client: %u already streaming", (unsigned) clients_);
+      ESP_LOGW(TAG, "refused a client: %u already streaming", (unsigned) clients_.load());
       continue;
     }
+    clients_++;
 
     auto *ca = new ClientArg{this, fd};
     if (xTaskCreatePinnedToCore(client_trampoline, "audio_client", 6144, ca, 3, nullptr, 0) !=
@@ -190,13 +194,12 @@ void AudioStream::accept_loop() {
       ESP_LOGE(TAG, "client task creation failed");
       delete ca;
       ::close(fd);
+      clients_--;
     }
   }
 }
 
 void AudioStream::client_loop(int fd) {
-  clients_++;
-
   // Don't let a stalled client pin a task forever, and send promptly: this is
   // a live stream, so latency matters more than packing full segments.
   struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
@@ -276,18 +279,22 @@ void AudioStream::client_loop(int fd) {
     ok = false;
 
   // Start at the live edge rather than replaying the buffer.
-  uint64_t read_pos = write_pos_;
+  uint32_t read_pos = write_pos_.load(std::memory_order_acquire);
   uint32_t dropped = 0;
+  // The writer keeps going while a chunk is being copied out, so a reader
+  // within one chunk of being lapped would copy samples as they are being
+  // overwritten. Treat that as already behind.
+  const uint32_t safe_depth = capacity_ - kChunkSamples;
 
   while (ok) {
-    const uint64_t head_pos = write_pos_;
-    uint64_t available = head_pos - read_pos;
+    const uint32_t head_pos = write_pos_.load(std::memory_order_acquire);
+    uint32_t available = head_pos - read_pos;  // exact across the counter's wrap
 
-    if (available > capacity_) {
+    if (available > safe_depth) {
       // The client fell behind the writer. Skip to half a buffer back: keep
       // some history so the stream resumes smoothly rather than at the very
       // edge, where it would immediately underrun again.
-      dropped += (uint32_t) (available - capacity_ / 2);
+      dropped += available - capacity_ / 2;
       read_pos = head_pos - capacity_ / 2;
       available = capacity_ / 2;
       ESP_LOGW(TAG, "client behind; dropped %u samples", (unsigned) dropped);
@@ -297,8 +304,8 @@ void AudioStream::client_loop(int fd) {
       continue;
     }
 
-    const uint32_t n = (uint32_t) std::min<uint64_t>(available, kChunkSamples);
-    uint32_t offset = (uint32_t) (read_pos % capacity_);
+    const uint32_t n = std::min(available, kChunkSamples);
+    uint32_t offset = read_pos % capacity_;
     uint32_t written = 0;
     for (uint32_t i = 0; i < n; i++) {
       int32_t s = ring_[offset];

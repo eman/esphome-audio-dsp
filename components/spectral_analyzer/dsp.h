@@ -88,6 +88,56 @@ inline float median_bin_power(const float *psd, uint32_t half, float bin_hz, flo
   return v[v.size() / 2];
 }
 
+// ------------------------------------------------------ robust spread ----
+
+// Median of a small sample. Sorts in place; the caller owns the scratch.
+inline float median_inplace(float *v, uint32_t n) {
+  if (n == 0)
+    return NAN;
+  std::nth_element(v, v + n / 2, v + n);
+  float m = v[n / 2];
+  if ((n & 1u) == 0) {
+    // Even count: average the two middle values, the lower of which is the
+    // largest element of the first half.
+    std::nth_element(v, v + n / 2 - 1, v + n / 2);
+    m = 0.5f * (m + v[n / 2 - 1]);
+  }
+  return m;
+}
+
+// Spread of per-frame values that is not destroyed by one bad frame.
+//
+// The standard deviation was the first choice and fails exactly where it is
+// needed: a marginal tone loses its band peak to noise in one frame out of
+// seven, that one frame lands 40 Hz away, and the standard deviation reads
+// ~15 Hz for a tone that held still in the other six. The median absolute
+// deviation ignores that frame. It is scaled by 1.4826 so that for ordinary
+// Gaussian scatter it reads the same as the standard deviation would, and the
+// thresholds already tuned against it still apply.
+struct Spread {
+  float median{NAN};
+  float spread{NAN};     // 1.4826 x MAD, in the values' own unit
+  float agreement{NAN};  // fraction of values within +/- tol of the median
+};
+
+// `scratch` must hold n floats; the input is not modified.
+inline Spread robust_spread(const float *values, uint32_t n, float tol, float *scratch) {
+  Spread r;
+  if (n < 2)
+    return r;
+  std::copy(values, values + n, scratch);
+  r.median = median_inplace(scratch, n);
+  uint32_t within = 0;
+  for (uint32_t i = 0; i < n; i++) {
+    scratch[i] = fabsf(values[i] - r.median);
+    if (scratch[i] <= tol)
+      within++;
+  }
+  r.spread = 1.4826f * median_inplace(scratch, n);
+  r.agreement = (float) within / (float) n;
+  return r;
+}
+
 // ----------------------------------------------------------- harmonics ----
 
 // A tone near `f_center`, measured against the noise around it.
@@ -155,7 +205,27 @@ class ZoomFFT {
     float peak_hz{NAN};
     float prominence_db{NAN};  // peak bin over the median of the band's bins
     float level_db{NAN};       // peak bin, RMS convention like the main FFT
+    // The second strongest separate line in the band, at least four bins
+    // from the first. Two machines running almost alike put two lines here;
+    // one machine puts noise here, at a random frequency every frame.
+    float second_hz{NAN};
+    float second_prominence_db{NAN};
+    // Periodic modulation of the band's envelope, from the spectrum of the
+    // decimated baseband's power. Two tones df apart beat at exactly df, so
+    // this and (second_hz - peak_hz) agreeing is the beating test. A single
+    // tone with noise reads a random frequency at a few dB prominence.
+    float modulation_hz{NAN};
+    float modulation_prominence_db{NAN};  // over the median of the search range
+    float modulation_depth{NAN};          // 0..1, sinusoidal power modulation index
   };
+
+  // Where to look for envelope modulation, in Hz. The frame length limits
+  // the resolution: 1024 points over a 110 Hz band give 0.15 Hz bins.
+  void set_modulation_range(float lo, float hi) {
+    mod_lo_ = lo;
+    mod_hi_ = hi;
+  }
+  float modulation_bin_hz() const { return bin_hz(); }  // same frame, same bins
 
   // Decimation that puts the band in the middle 70% of the decimated rate.
   // The remaining 30% is the anti-alias filter's transition band. Shared with
@@ -351,9 +421,78 @@ class ZoomFFT {
     result_.peak_hz = base + interpolate_peak(psd_.data(), m_, i_peak) * bin;
     result_.prominence_db = to_db(psd_[i_peak]) - to_db(median);
     result_.level_db = to_db(psd_[i_peak]);
+
+    // Second line: the strongest local maximum at least four bins from the
+    // first, so the first line's own Hann skirts are not reported as another.
+    result_.second_hz = NAN;
+    result_.second_prominence_db = NAN;
+    uint32_t i_second = 0;
+    for (uint32_t i = i_lo + 1; i < i_hi; i++) {
+      if (i + 4 > i_peak && i < i_peak + 4)
+        continue;
+      if (psd_[i] < psd_[i - 1] || psd_[i] <= psd_[i + 1])
+        continue;
+      if (i_second == 0 || psd_[i] > psd_[i_second])
+        i_second = i;
+    }
+    if (i_second != 0) {
+      result_.second_hz = base + interpolate_peak(psd_.data(), m_, i_second) * bin;
+      result_.second_prominence_db = to_db(psd_[i_second]) - to_db(median);
+    }
+
+    analyze_envelope_();
+  }
+
+  // Spectrum of the baseband's power over the same frame. The decimated
+  // signal is the band's analytic signal, so |y|^2 is its envelope power;
+  // two tones df apart make it a clean sinusoid at df, and a single tone
+  // makes it flat plus noise. Reuses re_/im_, which the line analysis has
+  // finished with.
+  void analyze_envelope_() {
+    result_.modulation_hz = NAN;
+    result_.modulation_prominence_db = NAN;
+    result_.modulation_depth = NAN;
+    const float bin = bin_hz();
+    const uint32_t k_lo = std::max<uint32_t>(1, (uint32_t) ceilf(mod_lo_ / bin));
+    const uint32_t k_hi = std::min<uint32_t>(m_ / 2 - 1, (uint32_t) floorf(mod_hi_ / bin));
+    if (k_lo + 2 > k_hi)
+      return;
+    double mean = 0.0;
+    for (uint32_t i = 0; i < m_; i++) {
+      const uint32_t j = (ring_pos_ + i) % m_;
+      re_[i] = ring_re_[j] * ring_re_[j] + ring_im_[j] * ring_im_[j];
+      mean += re_[i];
+    }
+    mean /= m_;
+    if (mean <= 0.0)
+      return;
+    for (uint32_t i = 0; i < m_; i++) {
+      re_[i] = (float) (re_[i] - mean) * window_[i];
+      im_[i] = 0.0f;
+    }
+    fft(re_.data(), im_.data(), m_);
+    // Power per bin, in place; each bin reads only its own index.
+    for (uint32_t k = 0; k <= k_hi; k++)
+      re_[k] = re_[k] * re_[k] + im_[k] * im_[k];
+    uint32_t k_peak = k_lo;
+    std::vector<float> range;
+    range.reserve(k_hi - k_lo + 1);
+    for (uint32_t k = k_lo; k <= k_hi; k++) {
+      if (re_[k] > re_[k_peak])
+        k_peak = k;
+      range.push_back(re_[k]);
+    }
+    std::nth_element(range.begin(), range.begin() + range.size() / 2, range.end());
+    result_.modulation_hz = interpolate_peak(re_.data(), k_hi + 1, k_peak) * bin;
+    result_.modulation_prominence_db = to_db(re_[k_peak]) - to_db(range[range.size() / 2]);
+    // A sinusoid of amplitude A in the windowed frame has a bin magnitude of
+    // A x m x cg / 2; for power P(t) = P0 (1 + d cos), A = d x P0.
+    const float amp = 2.0f * sqrtf(re_[k_peak]) / ((float) m_ * window_cg_);
+    result_.modulation_depth = std::min(1.0f, amp / (float) mean);
   }
 
   float fs_{48000.0f}, f_low_{0.0f}, f_high_{0.0f}, fc_{0.0f};
+  float mod_lo_{0.5f}, mod_hi_{5.0f};
   uint32_t m_{0}, d_{1};
   std::vector<float> h_;
 

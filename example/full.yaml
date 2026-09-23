@@ -5,6 +5,7 @@ esphome:
 
 esp32:
   board: esp32-p4-function-ev-board
+  variant: esp32p4
   framework:
     type: esp-idf
 
@@ -111,6 +112,8 @@ spectral_analyzer:
       peak_stability:
         name: "Tone 700 stability"
         id: tone700_stability
+      peak_agreement:
+        name: "Tone 700 agreement"
       # A machine has a harmonic series; a whistle mostly does not.
       harmonics:
         orders:
@@ -120,13 +123,21 @@ spectral_analyzer:
           - order: 3
             relative_level:
               name: "Tone 700 H3 relative"
-      # 0.15 Hz bins over this band alone, a result every 3.3 s.
+      # 0.15 Hz bins over this band alone, a result every 3.3 s. The second
+      # line and the envelope modulation together test for two similar
+      # machines beating: their separation equals the modulation frequency.
       zoom:
         fft_size: 1024
         peak_frequency:
           name: "Tone 700 zoom peak"
         peak_prominence:
           name: "Tone 700 zoom prominence"
+        second_peak_frequency:
+          name: "Tone 700 zoom second peak"
+        modulation_frequency:
+          name: "Tone 700 modulation"
+        modulation_prominence:
+          name: "Tone 700 modulation prominence"
 
     # Spare, for aiming at whatever the scan finds. Retune it from Home
     # Assistant rather than reflashing.
