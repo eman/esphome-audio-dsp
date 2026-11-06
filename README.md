@@ -334,7 +334,11 @@ by traffic to stitch.
 
 The capture task only copies samples into a 2.7 s ring; detection runs in its
 own task on core 1 below the capture task's priority, so a slow fit delays the
-detector, never the audio. Ridge storage (about 2.3 MB) goes in PSRAM.
+detector, never the audio. Everything sizeable, about 2.5 MB with the 156 kB
+spectrum, goes in PSRAM and is sized once at boot; nothing allocates while
+running. The first build put the spectrum in internal RAM because it looked
+free at setup, and a candidate list growing on a busy frame later found none
+and aborted. Every ten minutes the log reports the internal heap's lowest point.
 
 `components/doppler/doppler_dsp.h` has no ESPHome in it, and
 `tests/test_doppler.cpp` checks it against synthetic passes of known speed and

@@ -21,8 +21,11 @@ static void *big_alloc(size_t n) {
   return p != nullptr ? p : heap_caps_malloc(n, MALLOC_CAP_8BIT);
 }
 
-// The spectrum and decimator are touched every 85 ms: internal RAM if that
-// still leaves plenty for the network stack and DMA, PSRAM otherwise.
+// The decimator and the detector object (about 1.5 kB) are touched every
+// 85 ms: internal RAM if that still leaves plenty for the network stack and
+// DMA, PSRAM otherwise. Everything else, the 156 kB spectrum included, is
+// PSRAM: at boot internal RAM looks free, but the network and stream clients
+// claim it later.
 static void *fast_alloc(size_t n) {
   if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) > n + 128 * 1024) {
     void *p = heap_caps_malloc(n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -65,7 +68,7 @@ void Doppler::setup() {
   }
   this->source_->add_consumer([this](const int32_t *s, uint32_t n) { this->push_(s, n); });
   this->load_since_us_ = esp_timer_get_time();
-  ESP_LOGI(TAG, "internal heap free %u", (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+  ESP_LOGI(TAG, "internal heap free %u after setup", (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 }
 
 // Capture task. Copies and wakes the detector; nothing else.
@@ -167,10 +170,19 @@ void Doppler::update() {
     ESP_LOGW(TAG, "detector fell behind and skipped %.1f s of audio", skipped / (float) dsp::kFsIn);
   if (this->load_ != nullptr && wall > 0)
     this->load_->publish_state(100.0f * (float) busy / (float) wall);
-  if (this->det_ != nullptr)
-    ESP_LOGD(TAG, "%u live ridges, %u fits so far, %u dropped, %u truncated", (unsigned) this->det_->live_ridges(),
-             (unsigned) this->det_->fits(), (unsigned) this->det_->dropped_ridges(),
-             (unsigned) this->det_->truncated_ridges());
+  const uint32_t min_free = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+  if (min_free < 32 * 1024 && !this->low_heap_warned_) {
+    ESP_LOGW(TAG, "internal heap has been down to %u bytes", (unsigned) min_free);
+    this->low_heap_warned_ = true;
+  }
+  if (this->det_ != nullptr && this->updates_++ % 10 == 0) {
+    ESP_LOGI(TAG, "%u live ridges, %u fits, %u ridges dropped, %u truncated, %u passes dropped; "
+             "internal heap %u free, %u lowest, largest block %u",
+             (unsigned) this->det_->live_ridges(), (unsigned) this->det_->fits(),
+             (unsigned) this->det_->dropped_ridges(), (unsigned) this->det_->truncated_ridges(),
+             (unsigned) this->det_->dropped_passes(), (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned) min_free, (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+  }
 }
 
 void Doppler::dump_config() {

@@ -94,6 +94,8 @@ class Doppler : public PollingComponent {
   int64_t load_since_us_{0};
   std::atomic<uint32_t> skipped_{0};  // samples lost to a full ring
   uint32_t count_total_{0};
+  uint32_t updates_{0};
+  bool low_heap_warned_{false};
 
   sensor::Sensor *speed_{nullptr}, *distance_{nullptr}, *frequency_{nullptr}, *swing_{nullptr}, *level_{nullptr},
       *count_{nullptr}, *load_{nullptr};

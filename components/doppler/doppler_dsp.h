@@ -64,6 +64,30 @@ inline float sound_speed(float temp_c) { return 331.3f * sqrtf(1.0f + temp_c / 2
 // the firmware does.
 using AllocFn = void *(*) (size_t);
 
+// Where the detector's arrays live. On the node that is PSRAM: internal RAM
+// is the network stack's, and a vector growing there once failed mid-run and
+// aborted. Set by Detector::init; every array is sized there and never grows
+// after, so nothing allocates while audio is running.
+inline AllocFn &array_alloc() {
+  static AllocFn f = std::malloc;
+  return f;
+}
+template<class T> struct ArrayAlloc {
+  using value_type = T;
+  ArrayAlloc() = default;
+  template<class U> ArrayAlloc(const ArrayAlloc<U> &) {}
+  T *allocate(size_t n) {
+    void *p = array_alloc()(n * sizeof(T));
+    if (p == nullptr)
+      std::abort();  // only at init, and only if PSRAM is gone
+    return static_cast<T *>(p);
+  }
+  void deallocate(T *p, size_t) { std::free(p); }
+  template<class U> bool operator==(const ArrayAlloc<U> &) const { return true; }
+  template<class U> bool operator!=(const ArrayAlloc<U> &) const { return false; }
+};
+template<class T> using Array = std::vector<T, ArrayAlloc<T>>;
+
 struct Params {
   float f_lo{40.0f}, f_hi{5000.0f};
   float peak_db{8.0f};
@@ -641,6 +665,7 @@ class Detector {
   // Returns false on allocation failure.
   bool init(const Params &p, AllocFn alloc = std::malloc, AllocFn fast = std::malloc) {
     P_ = p;
+    array_alloc() = alloc;
     P_.fit_points = std::min<uint32_t>(std::max<uint32_t>(P_.fit_points, 64), 1024);
     long_cap_ = (uint32_t) floor(P_.max_track_s / kDt) + 2;
     slots_.assign(P_.ridges, Slot{});
@@ -661,7 +686,7 @@ class Detector {
       if (!l.frame || !l.f || !l.db)
         return false;
     }
-    spec_ = (Spectrum *) fast(sizeof(Spectrum));
+    spec_ = (Spectrum *) alloc(sizeof(Spectrum));  // 156 kB: too much for internal RAM
     dec_ = (Decimator *) fast(sizeof(Decimator));
     if (!spec_ || !dec_)
       return false;
@@ -679,9 +704,10 @@ class Detector {
     seq_.assign(P_.ridges, 0);
     tmp_.reserve(P_.ridges);
     took_.assign(P_.ridges, false);
-    cands_.reserve(P_.ridges * 4);
-    pending_.reserve(16);
-    done_.reserve(16);
+    // Worst cases, so these never reallocate: every live ridge near every peak.
+    cands_.reserve(P_.ridges * kMaxPeaks);
+    pending_.reserve(kPassQueue);
+    done_.reserve(kPassQueue);
     return true;
   }
 
@@ -717,7 +743,7 @@ class Detector {
       close_chain_(ci);
     pool_.clear();
     for (auto &g : pending_)
-      done_.push_back(g);
+      push_done_(g);
     pending_.clear();
   }
 
@@ -739,6 +765,7 @@ class Detector {
   uint32_t dropped_ridges() const { return dropped_; }  // no free slot
   uint32_t truncated_ridges() const { return truncated_; }  // no long buffer
   uint32_t fits() const { return fits_; }
+  uint32_t dropped_passes() const { return dropped_passes_; }
 
  protected:
   struct Cand {
@@ -980,7 +1007,19 @@ class Detector {
     g.f0s[0] = f.f0;
     g.lines = 1;
     g.last_added = now();
+    if (pending_.size() == kPassQueue) {  // not seen in practice; publish the oldest early
+      push_done_(pending_.front());
+      pending_.erase(pending_.begin());
+    }
     pending_.push_back(g);
+  }
+
+  void push_done_(const Pass &g) {
+    if (done_.size() == kPassQueue) {  // nobody is popping; drop the oldest
+      done_.erase(done_.begin());
+      dropped_passes_++;
+    }
+    done_.push_back(g);
   }
 
   void frame_() {
@@ -1070,7 +1109,7 @@ class Detector {
     const double tn = now();
     for (size_t i = 0; i < pending_.size();) {
       if (tn - pending_[i].last_added >= P_.group_hold_s) {
-        done_.push_back(pending_[i]);
+        push_done_(pending_[i]);
         pending_.erase(pending_.begin() + i);
       } else {
         i++;
@@ -1094,25 +1133,27 @@ class Detector {
 
   Params P_;
   uint32_t long_cap_{0};
-  std::vector<Slot> slots_;
-  std::vector<Slot> chains_;     // finished ridges and their continuations; always long buffers
-  std::vector<uint32_t> pool_;   // chains a ridge may still continue, oldest first
-  std::vector<Long> longs_;
+  static constexpr size_t kPassQueue = 32;
+  Array<Slot> slots_;
+  Array<Slot> chains_;     // finished ridges and their continuations; always long buffers
+  Array<uint32_t> pool_;   // chains a ridge may still continue, oldest first
+  Array<Long> longs_;
   Spectrum *spec_{nullptr};
   Decimator *dec_{nullptr};
-  std::vector<float> frame_buf_, dec_out_;
+  Array<float> frame_buf_, dec_out_;
   uint32_t fill_{0};
   uint64_t decimated_{0};
   uint32_t frame_idx_{0};
   uint32_t live_{0}, dropped_{0}, truncated_{0}, fits_{0};
   float *fit_t_{nullptr}, *fit_f_{nullptr}, *fit_db_{nullptr};
   FitScratch scratch_;
-  std::vector<Pass> pending_, done_;
+  Array<Pass> pending_, done_;
   std::vector<Fit> *fit_log_{nullptr};
-  std::vector<uint32_t> order_, by_order_, seq_, tmp_;
+  Array<uint32_t> order_, by_order_, seq_, tmp_;
   uint32_t next_seq_{0};
-  std::vector<bool> took_;
-  std::vector<Cand> cands_;
+  Array<bool> took_;
+  Array<Cand> cands_;
+  uint32_t dropped_passes_{0};
 };
 
 }  // namespace dsp
