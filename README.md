@@ -37,16 +37,17 @@ audio_stream:
   source: mic
 ```
 
-## Three components
+## Four components
 
 | | |
 |---|---|
 | `audio_source` | Owns the I2S peripheral, hands blocks of samples to everything that wants them |
 | `spectral_analyzer` | FFT, configurable bands, periodic discovery scan |
 | `audio_stream` | Endless WAV over HTTP |
+| `doppler` | Passing tonal sources: speed, closest distance and frequency of each pass |
 
-The source exists so the analyzer and the stream can share one microphone. Use
-either consumer on its own, or both.
+The source exists so the consumers can share one microphone. Use any of them
+on its own, or all of them.
 
 ## Why not build on ESPHome's `microphone`?
 
@@ -257,6 +258,93 @@ known answers, and optionally a real capture:
 c++ -std=c++17 -O2 -I components tests/test_dsp.cpp -o /tmp/test_dsp
 /tmp/test_dsp                 # synthetic
 /tmp/test_dsp clip.wav        # plus a 24-bit capture from audio_stream
+```
+
+## Doppler passes
+
+`doppler` watches for a tonal line gliding down an S-shaped curve, which is
+what an aircraft, a helicopter or a vehicle with a whine sounds like going past,
+and fits the exact moving-source model to it:
+
+    f = f0 / (1 + (v/c) x / r),   x = v (tau - t0),  r = sqrt(d^2 + x^2)
+
+with tau the emission time of the sound heard at t (tau + r/c = t). The swing
+between the two plateaus gives the speed `v`, the time the glide takes gives
+the closest distance `d`. One microphone gives no bearing.
+
+```yaml
+doppler:
+  source: mic
+  temperature: outdoor_temp     # optional; sets the speed of sound
+  temperature_unit: F
+  speed:
+    name: "Doppler pass speed"
+  distance:
+    name: "Doppler pass distance"
+  min_time_scale: 5s            # default; 0s also reports close vehicles
+  frequency:
+    name: "Doppler pass frequency"
+  passes:
+    name: "Doppler passes"
+  last_pass:
+    name: "Doppler last pass"   # JSON: f0, beta, T and when, enough to redraw the curve
+  load:
+    name: "Doppler load"        # share of real time the detector task is busy
+```
+
+Pipeline: the 48 kHz stream is decimated to 12 kHz, an 8192-point FFT runs every
+1024 samples (1.46 Hz bins, 85 ms hops), tonal peaks are picked against a running
+median over +-88 Hz, and peaks are linked into ridges. Ridges are stitched into
+chains across gaps and overlaps where one carries on the other's glide, since a
+car going by masks a distant aircraft for seconds at a time. Each chain is fitted
+once nothing can continue it. The fine bins are for aircraft: one 4 km away
+glides about 0.3 Hz/s, which 5.86 Hz bins could not follow at all. A car at 8 m
+still fits to a few percent with the time-scale gate off. Decimating first makes the FFT about five times
+cheaper than the same bins at 48 kHz.
+
+What is rejected, and why it has to be. An engine changing RPM and a machine
+spinning down move every harmonic together, exactly as Doppler does, so
+harmonics prove nothing. The tests, in order:
+
+- T = d/v is at least `min_time_scale` (5 s). A glide over a second or two
+  is any pitch step, a bird's or an engine shifting gear, and its shape cannot
+  tell them apart. This gives up close vehicles: a car 10 m off at 15 m/s has
+  T 0.7 s. Set it to `0s` to have them reported, false alarms included;
+- the chain spans two time constants T in all, and 1.2 T on each side of
+  closest approach, or 15 s if that is less but never under 0.6 T. A short
+  pass can always show its plateaus; for an aircraft 4 km off T is near 40 s,
+  and traffic noise rarely leaves 48 s of its line clean on both sides;
+- it fits the model to within 1 Hz rms, with a swing at least 30 times that.
+  Real passes have fitted to 0.2-0.5 Hz; machine tones nudged by clicks and
+  noise that happens to bend, to 0.6-2 Hz;
+- it is loudest within T of closest approach, and 2 dB louder there than at
+  1.2 T;
+- if the chain reaches beyond 3 T, it is at least 6 dB quieter out there. A
+  passing source goes away again; a steady tone that steps a few Hz does not.
+
+Checked against ADS-B on three hours of the node's audio (32 aircraft within
+8 km), this reported the two propeller aircraft whose lines were audible (a
+King Air at 4 km and a TBM at 5.8 km: speed within 3% and 13%, distance within
+8% and 30%) and nothing else. The thresholds were set on the first two hours.
+The last hour, held out, gave four false alarms, all with T under 2 s (birds
+near 550 Hz, an engine stepping its RPM), which is what the time-scale gate
+was then added for; that hour no longer counts as held out. Jets at 2.5-7 km
+left no tonal line to find, and a Cessna 172 at 2.1 km left a line too broken
+by traffic to stitch.
+
+The capture task only copies samples into a 2.7 s ring; detection runs in its
+own task on core 1 below the capture task's priority, so a slow fit delays the
+detector, never the audio. Ridge storage (about 2.3 MB) goes in PSRAM.
+
+`components/doppler/doppler_dsp.h` has no ESPHome in it, and
+`tests/test_doppler.cpp` checks it against synthetic passes of known speed and
+distance and against signals it must reject:
+
+```sh
+c++ -std=c++17 -O2 -Wall -Wextra -I components tests/test_doppler.cpp -o /tmp/test_doppler
+/tmp/test_doppler                    # synthetic
+/tmp/test_doppler clip.wav           # plus every pass in a 24-bit capture
+/tmp/test_doppler --fits clip.wav    # every fit as TSV
 ```
 
 ## Retuning bands at runtime
