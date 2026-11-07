@@ -178,9 +178,12 @@ void SpectralAnalyzer::setup() {
 
   // Warn rather than fail: the node keeps working, it just loses audio in a
   // way that is invisible from outside. The FFT runs in the source's capture
-  // task, so the DMA ring has to cover however long it takes.
+  // task, so the DMA ring has to cover however long it takes. Scaled from
+  // the 114 ms a 32768-point FFT takes on an ESP32-P4 at 360 MHz, which is
+  // 0.23 us per N log2 N. (This used 3.5e-6 ms, 66 times too small, so the
+  // warning could never fire.)
   const uint32_t fft_ms =
-      (uint32_t) (3.5e-6f * this->air_.fft_size * log2f((float) this->air_.fft_size));
+      (uint32_t) (2.3e-4f * this->air_.fft_size * log2f((float) this->air_.fft_size));
   if (this->source_->dma_duration_ms() < 2 * fft_ms)
     ESP_LOGW(TAG,
              "DMA holds %u ms but one FFT takes about %u ms - audio will be lost silently. "
