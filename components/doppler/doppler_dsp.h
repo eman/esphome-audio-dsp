@@ -268,10 +268,29 @@ class Spectrum {
       if (!(c > db_[k - 1] && c >= db_[k + 1]))
         continue;
       // Median of the +-kMedHalf neighbourhood, ends replicated (scipy's
-      // median_filter, mode="nearest").
-      for (int j = -(int) kMedHalf; j <= (int) kMedHalf; j++) {
-        const int kk = std::min<int>(std::max<int>((int) k + j, 0), (int) kBins - 1);
-        win[j + kMedHalf] = db_[kk];
+      // median_filter, mode="nearest"). Most local maxima are noise, and
+      // finding their median was nine tenths of the detector's time. The
+      // excess can reach peak_db only if the median is at most c - peak_db,
+      // that is if kMedHalf + 1 of the values are; counting them is far
+      // cheaper. The margin keeps this a pure prefilter, so the decision
+      // below is still made exactly as before.
+      const float thr = c - p.peak_db + 0.01f;
+      uint32_t below = 0;
+      if (k >= kMedHalf && k + kMedHalf < kBins) {
+        const float *w = db_ + k - kMedHalf;
+        for (uint32_t j = 0; j < 2 * kMedHalf + 1; j++)
+          below += w[j] <= thr;
+        if (below < kMedHalf + 1)
+          continue;
+        memcpy(win, w, sizeof(win));
+      } else {
+        for (int j = -(int) kMedHalf; j <= (int) kMedHalf; j++) {
+          const int kk = std::min<int>(std::max<int>((int) k + j, 0), (int) kBins - 1);
+          win[j + kMedHalf] = db_[kk];
+          below += db_[kk] <= thr;
+        }
+        if (below < kMedHalf + 1)
+          continue;
       }
       std::nth_element(win, win + kMedHalf, win + 2 * kMedHalf + 1);
       const float ex = c - win[kMedHalf];
