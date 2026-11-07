@@ -37,6 +37,19 @@ static void *fast_alloc(size_t n) {
 
 static void task_trampoline(void *arg) { static_cast<Doppler *>(arg)->task_loop(); }
 
+// The capture task outranks the detector task and core 1's idle task ranks
+// below it. A run of fits can keep the core busy for seconds, and the task
+// watchdog fires if the idle task gets nothing for 5 s: let it in every
+// 100 ms. Called between steps and, through the detector, after every fit.
+// Only the detector task touches this.
+static int64_t idle_chance_us = 0;
+static void let_idle_in() {
+  if (esp_timer_get_time() - idle_chance_us > 100000) {
+    vTaskDelay(1);
+    idle_chance_us = esp_timer_get_time();
+  }
+}
+
 void Doppler::setup() {
   if (this->source_->sample_rate() != dsp::kFsIn) {
     ESP_LOGE(TAG, "source runs at %" PRIu32 " Hz; the detector needs %" PRIu32, this->source_->sample_rate(),
@@ -57,6 +70,7 @@ void Doppler::setup() {
     this->mark_failed();
     return;
   }
+  this->det_->set_yield(let_idle_in);
   this->passes_ = xQueueCreate(8, sizeof(Item));
   // Core 1 with the capture task, below its priority 5: a long fit delays
   // this task, never the capture. Core 0 has the network and the main loop.
@@ -97,16 +111,25 @@ void Doppler::task_loop() {
       this->read_pos_ = to;
     }
     this->det_->set_sound_speed(this->sound_speed_.load(std::memory_order_relaxed));
-    const int64_t t0 = esp_timer_get_time();
     while (this->read_pos_ != w) {
       const uint32_t at = this->read_pos_ & (kRing - 1);
       const uint32_t n = std::min({w - this->read_pos_, kChunk, kRing - at});
       for (uint32_t i = 0; i < n; i++)
         buf[i] = (float) this->ring_[at + i] * (1.0f / 8388608.0f);
+      const uint32_t fits0 = this->det_->fits();
+      const int64_t c0 = esp_timer_get_time();
       this->det_->feed(buf, n);
+      const int64_t c1 = esp_timer_get_time();
       this->read_pos_ += n;
+      // Wall time, so it includes the capture task preempting us.
+      const uint32_t dt = (uint32_t) (c1 - c0);
+      this->busy_us_.fetch_add(dt, std::memory_order_relaxed);
+      if (this->det_->fits() != fits0)
+        this->fit_us_.fetch_add(dt, std::memory_order_relaxed);
+      if (dt > this->max_chunk_us_.load(std::memory_order_relaxed))
+        this->max_chunk_us_.store(dt, std::memory_order_relaxed);
+      let_idle_in();
     }
-    this->busy_us_.fetch_add((uint32_t) (esp_timer_get_time() - t0), std::memory_order_relaxed);
     Item it;
     while (this->det_->pop(it.pass)) {
       it.ago_s = (float) (this->det_->now() - it.pass.best.t_heard);
@@ -170,18 +193,27 @@ void Doppler::update() {
     ESP_LOGW(TAG, "detector fell behind and skipped %.1f s of audio", skipped / (float) dsp::kFsIn);
   if (this->load_ != nullptr && wall > 0)
     this->load_->publish_state(100.0f * (float) busy / (float) wall);
+  if (this->count_ != nullptr && !this->count_->has_state())
+    this->count_->publish_state((float) this->count_total_);  // 0 until the first pass, not unknown
   const uint32_t min_free = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
   if (min_free < 32 * 1024 && !this->low_heap_warned_) {
     ESP_LOGW(TAG, "internal heap has been down to %u bytes", (unsigned) min_free);
     this->low_heap_warned_ = true;
   }
-  if (this->det_ != nullptr && this->updates_++ % 10 == 0) {
-    ESP_LOGI(TAG, "%u live ridges, %u fits, %u ridges dropped, %u truncated, %u passes dropped; "
-             "internal heap %u free, %u lowest, largest block %u",
+  this->win_busy_us_ += busy;
+  this->win_fit_us_ += this->fit_us_.exchange(0, std::memory_order_relaxed);
+  this->win_wall_us_ += wall;
+  if (this->det_ != nullptr && this->updates_++ % 5 == 0) {
+    const double w = std::max<double>(1.0, (double) this->win_wall_us_);
+    ESP_LOGI(TAG, "busy %.1f%% (fits %.1f%%), longest step %.0f ms; %u live ridges, %u fits, %u ridges dropped, "
+             "%u truncated, %u passes dropped; internal heap %u free, %u lowest, largest block %u",
+             100.0 * this->win_busy_us_ / w, 100.0 * this->win_fit_us_ / w,
+             this->max_chunk_us_.exchange(0, std::memory_order_relaxed) / 1000.0,
              (unsigned) this->det_->live_ridges(), (unsigned) this->det_->fits(),
              (unsigned) this->det_->dropped_ridges(), (unsigned) this->det_->truncated_ridges(),
              (unsigned) this->det_->dropped_passes(), (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned) min_free, (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    this->win_busy_us_ = this->win_fit_us_ = this->win_wall_us_ = 0;
   }
 }
 

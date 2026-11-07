@@ -149,9 +149,10 @@ struct Params {
   uint32_t long_ridges{128}; // buffers for ridges past kShortPts points, and for chains
 };
 
-// In-place iterative radix-2. tw_re/tw_im hold exp(-2 pi i k / n) for
-// k < n / 2; a recurrence drifts too far over 4096 steps in float.
-inline void fft(float *re, float *im, uint32_t n, const float *tw_re, const float *tw_im) {
+// In-place iterative radix-2. tw_re/tw_im hold exp(-2 pi i k / (n tw_step))
+// for k < n tw_step / 2, so one table serves an FFT of half the size with
+// tw_step 2; a recurrence drifts too far over 4096 steps in float.
+inline void fft(float *re, float *im, uint32_t n, const float *tw_re, const float *tw_im, uint32_t tw_step = 1) {
   for (uint32_t i = 1, j = 0; i < n; i++) {
     uint32_t bit = n >> 1;
     for (; j & bit; bit >>= 1)
@@ -163,7 +164,7 @@ inline void fft(float *re, float *im, uint32_t n, const float *tw_re, const floa
     }
   }
   for (uint32_t len = 2; len <= n; len <<= 1) {
-    const uint32_t h = len / 2, stride = n / len;
+    const uint32_t h = len / 2, stride = n / len * tw_step;
     for (uint32_t i = 0; i < n; i += len) {
       for (uint32_t k = 0; k < h; k++) {
         const float cr = tw_re[k * stride], ci = tw_im[k * stride];
@@ -249,15 +250,39 @@ class Spectrum {
     }
   }
 
+  // Windowed power spectrum of kNfft real samples into db_, by one complex
+  // FFT of half the length: even samples as the real part, odd as the
+  // imaginary, then the two halves separated. Half the work and half the
+  // memory of the obvious way, and on the node the memory is what costs:
+  // the arrays are in PSRAM, behind a cache smaller than all of them.
+  void power_db(const float *x) {
+    constexpr uint32_t M = kNfft / 2;
+    for (uint32_t i = 0; i < M; i++) {
+      re_[i] = x[2 * i] * win_[2 * i];
+      im_[i] = x[2 * i + 1] * win_[2 * i + 1];
+    }
+    fft(re_, im_, M, tw_re_, tw_im_, 2);
+    auto put = [&](uint32_t k, float xr, float xi) {
+      db_[k] = 10.0f * log10f(norm_ * (xr * xr + xi * xi) + 1e-20f);
+    };
+    put(0, re_[0] + im_[0], 0.0f);
+    put(M, re_[0] - im_[0], 0.0f);
+    for (uint32_t k = 1; k < M; k++) {
+      // A = Z[k], B = Z[M - k]. X[k] = E + W^k O with E = (A + conj B) / 2,
+      // O = (A - conj B) / 2i, W = exp(-2 pi i / kNfft).
+      const float ar = re_[k], ai = im_[k], br = re_[M - k], bi = im_[M - k];
+      const float er = 0.5f * (ar + br), ei = 0.5f * (ai - bi);
+      const float orr = 0.5f * (ai + bi), oi = -0.5f * (ar - br);
+      const float wr = tw_re_[k], wi = tw_im_[k];
+      put(k, er + wr * orr - wi * oi, ei + wr * oi + wi * orr);
+    }
+  }
+
+  const float *db() const { return db_; }
+
   // x: kNfft samples at 12 kHz, oldest first. Returns the number of peaks.
   uint32_t analyze(const float *x, const Params &p, Peak *out) {
-    for (uint32_t i = 0; i < kNfft; i++) {
-      re_[i] = x[i] * win_[i];
-      im_[i] = 0.0f;
-    }
-    fft(re_, im_, kNfft, tw_re_, tw_im_);
-    for (uint32_t k = 0; k < kBins; k++)
-      db_[k] = 10.0f * log10f(norm_ * (re_[k] * re_[k] + im_[k] * im_[k]) + 1e-20f);
+    power_db(x);
 
     const uint32_t k_lo = std::max<uint32_t>(1, (uint32_t) ceilf(p.f_lo / kBinHz));
     const uint32_t k_hi = std::min<uint32_t>(kBins - 1, (uint32_t) (p.f_hi / kBinHz));
@@ -329,7 +354,7 @@ class Spectrum {
   static constexpr uint32_t kCandMax = 1024;
   float win_[kNfft];
   float norm_;
-  float re_[kNfft], im_[kNfft];
+  float re_[kNfft / 2], im_[kNfft / 2];
   float tw_re_[kNfft / 2], tw_im_[kNfft / 2];
   float db_[kBins];
   uint32_t cand_k_[kCandMax];
@@ -447,15 +472,23 @@ inline bool solve4(double A[4][4], double b[4], double x[4]) {
 // variables, with bounds by clamping.
 inline void lm(float p[4], const float lo[4], const float hi[4], const float sc[4], const float *t,
                const float *f, uint32_t n, float c, float fscale, FitScratch &s) {
+  // Per point in float, summed in blocks of 16 into double. The P4 has a
+  // single-precision FPU only; double arithmetic per point made a fit take
+  // up to a second there.
+  const float inv_fs2 = 1.0f / (fscale * fscale);
   auto cost = [&](const float *pp, float *m, float *r) {
     model(pp, t, n, c, m);
     double sum = 0.0;
+    float part = 0.0f;
     for (uint32_t i = 0; i < n; i++) {
       r[i] = m[i] - f[i];
-      const double z = (double) r[i] * r[i] / ((double) fscale * fscale);
-      sum += 2.0 * (sqrt(1.0 + z) - 1.0);
+      part += sqrtf(1.0f + r[i] * r[i] * inv_fs2) - 1.0f;
+      if ((i & 15) == 15) {
+        sum += part;
+        part = 0.0f;
+      }
     }
-    return sum;
+    return 2.0 * (sum + part);
   };
   float *m = s.m, *mn = s.mn, *r = s.r, *rn = s.rn, *J = s.jac;
   double C = cost(p, m, r);
@@ -474,14 +507,24 @@ inline void lm(float p[4], const float lo[4], const float hi[4], const float sc[
         J[j * n + i] = (mn[i] - m[i]) / hs;
     }
     double A[4][4] = {}, g[4] = {};
+    float Ab[4][4] = {}, gb[4] = {};
     for (uint32_t i = 0; i < n; i++) {
-      const double z = (double) r[i] * r[i] / ((double) fscale * fscale);
-      const double w = 1.0 / sqrt(1.0 + z);
+      const float w = 1.0f / sqrtf(1.0f + r[i] * r[i] * inv_fs2);
       for (int a = 0; a < 4; a++) {
-        const double ja = J[a * n + i];
-        g[a] += w * ja * r[i];
+        const float wja = w * J[a * n + i];
+        gb[a] += wja * r[i];
         for (int b = a; b < 4; b++)
-          A[a][b] += w * ja * J[b * n + i];
+          Ab[a][b] += wja * J[b * n + i];
+      }
+      if ((i & 15) == 15 || i == n - 1) {
+        for (int a = 0; a < 4; a++) {
+          g[a] += gb[a];
+          gb[a] = 0.0f;
+          for (int b = a; b < 4; b++) {
+            A[a][b] += Ab[a][b];
+            Ab[a][b] = 0.0f;
+          }
+        }
       }
     }
     for (int a = 0; a < 4; a++)
@@ -731,6 +774,9 @@ class Detector {
   }
 
   void set_sound_speed(float c) { P_.sound_speed = c; }
+  // Called after every fit, so the caller can let other work in during a
+  // run of them.
+  void set_yield(void (*fn)()) { yield_ = fn; }
   const Params &params() const { return P_; }
 
   // 48 kHz samples, full scale +-1. Feed in blocks of at most 1024.
@@ -889,7 +935,10 @@ class Detector {
       fit_db_[i] = db[j];
     }
     Fit fit;
-    if (fit_ridge(fit_t_, fit_f_, fit_db_, s.count, t_first, P_, scratch_, fit)) {
+    const bool fitted = fit_ridge(fit_t_, fit_f_, fit_db_, s.count, t_first, P_, scratch_, fit);
+    if (yield_ != nullptr)
+      yield_();  // a frame can close many chains, each fitted in turn
+    if (fitted) {
       fits_++;
       if (fit_log_)
         fit_log_->push_back(fit);
@@ -1173,6 +1222,7 @@ class Detector {
   Array<bool> took_;
   Array<Cand> cands_;
   uint32_t dropped_passes_{0};
+  void (*yield_)(){nullptr};
 };
 
 }  // namespace dsp

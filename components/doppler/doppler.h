@@ -91,6 +91,9 @@ class Doppler : public PollingComponent {
 
   // Busy time of the detector task against wall time, for the load sensor.
   std::atomic<uint32_t> busy_us_{0};
+  std::atomic<uint32_t> fit_us_{0};        // the part of it in steps that ran a fit
+  std::atomic<uint32_t> max_chunk_us_{0};  // longest single step since last reported
+  uint64_t win_busy_us_{0}, win_fit_us_{0}, win_wall_us_{0};  // over the reporting window
   int64_t load_since_us_{0};
   std::atomic<uint32_t> skipped_{0};  // samples lost to a full ring
   uint32_t count_total_{0};

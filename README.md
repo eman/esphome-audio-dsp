@@ -338,7 +338,27 @@ detector, never the audio. Everything sizeable, about 2.5 MB with the 156 kB
 spectrum, goes in PSRAM and is sized once at boot; nothing allocates while
 running. The first build put the spectrum in internal RAM because it looked
 free at setup, and a candidate list growing on a busy frame later found none
-and aborted. Every ten minutes the log reports the internal heap's lowest point.
+and aborted. Every five minutes the log reports the detector's busy share
+(and how much of it was fits), its longest single step, and the internal
+heap's lowest point.
+
+What it costs on an ESP32-P4 at 360 MHz, next to the spectral analyzer:
+about 30% of core 1, fits 2% of it, the longest step 200-400 ms. Getting
+there took four things, each measured on the node:
+
+- the median at each local maximum is taken only after counting shows it
+  can pass (61% to 45%);
+- the 8192-point FFT runs as a 4096-point complex FFT of the even and odd
+  samples. Half the work, and half the PSRAM traffic, which is what costs:
+  the arrays sit behind a 128 kB cache that the analyzer shares;
+- the fit's per-point arithmetic is single precision. The P4's FPU has no
+  double, and a fit took up to a second in software double;
+- the task gives core 1's idle task a tick every 100 ms, including between
+  fits. A frame that closed several chains once kept the core busy past the
+  task watchdog's 5 s.
+
+Building the detector at -O2 instead of ESPHome's -Os bought only 45% to 41%
+and is not done.
 
 `components/doppler/doppler_dsp.h` has no ESPHome in it, and
 `tests/test_doppler.cpp` checks it against synthetic passes of known speed and
