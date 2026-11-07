@@ -330,7 +330,21 @@ The last hour, held out, gave four false alarms, all with T under 2 s (birds
 near 550 Hz, an engine stepping its RPM), which is what the time-scale gate
 was then added for; that hour no longer counts as held out. Jets at 2.5-7 km
 left no tonal line to find, and a Cessna 172 at 2.1 km left a line too broken
-by traffic to stitch.
+by traffic to stitch. A first live run, 2.7 h on data no threshold had seen,
+reported one pass, the same King Air, 0.1 s from its ADS-B closest approach:
+speed +7%, distance +22%, no false alarms, 14 other aircraft (12 jets) silent.
+
+Read distance as the closest distance of the straight, constant-speed path
+that best matches the glide, not of the aircraft. Fitting this model to the
+pitch curve the ADS-B track itself predicts, with no audio involved, gives
+what the node got from the audio: 3.9 km for the TBM (node 4.1, true 5.8; it
+descended 1 km and turned 35 degrees while passing) and 4.3 km for the King
+Air (node 4.3, true 4.0; climbing 1.2 km). On the live pass, flown level, the
+same test gives 4.0 km for the track smoothed straight and 4.5 to 5.3 km
+once it keeps the track's 8 degrees of heading wander; the node read 5.0.
+So the fit is right about the sound, and a few degrees of turn near closest
+approach are enough to move distance by 20 to 30% with one microphone. Speed
+is far less sensitive to the path's shape.
 
 The capture task only copies samples into a 2.7 s ring; detection runs in its
 own task on core 1 below the capture task's priority, so a slow fit delays the
